@@ -243,7 +243,7 @@ impl EditableDocument {
     
     fn terminal_to_rope_pos(&self, col: u16, row: u16) -> usize {
         // Convert terminal click to PDF coordinates
-        let (pdf_x, pdf_y) = self.terminal_metrics.terminal_to_pdf(col, row.saturating_sub(2)); // -2 for debug line
+        let (pdf_x, pdf_y) = self.terminal_metrics.terminal_to_pdf(col, row.saturating_sub(1)); // -1 for 1-based indexing
         
         // Find the closest element to the clicked PDF coordinate
         let mut best_element_idx = 0;
@@ -356,11 +356,7 @@ impl EditableDocument {
         let mut cursor_terminal_row = 1;
         let mut cursor_terminal_col = 1;
         
-        // Print debug info about coordinate system
-        print!("\x1b[1;1H📏 Terminal: {}x{} | Cell: {:.1}x{:.1}pts | DPI: {:.0}", 
-               self.terminal_metrics.cols, self.terminal_metrics.rows,
-               self.terminal_metrics.cell_width_pts, self.terminal_metrics.cell_height_pts,
-               self.terminal_metrics.dpi);
+        // Clean display - no debug clutter
         
         // Render each element individually using absolute PDF coordinates
         for (line_idx, line_element_indices) in self.lines.iter().enumerate() {
@@ -388,12 +384,12 @@ impl EditableDocument {
                 
                 if !element_chars.is_empty() {
                     // Position cursor using absolute coordinates and print element
-                    print!("\x1b[{};{}H{}", term_row + 2, term_col + 1, element_chars); // +2 to avoid debug line
+                    print!("\x1b[{};{}H{}", term_row + 1, term_col + 1, element_chars); // Absolute positioning
                     
                     // Check if cursor should be positioned here
                     if self.cursor_pos >= element_start && self.cursor_pos < element_start + element_chars.len() {
                         let char_offset_in_element = self.cursor_pos - element_start;
-                        cursor_terminal_row = term_row + 2;
+                        cursor_terminal_row = term_row + 1;
                         cursor_terminal_col = term_col + 1 + char_offset_in_element as u16;
                     }
                     
@@ -403,7 +399,7 @@ impl EditableDocument {
                         
                         if sel_start < element_start + element_chars.len() && sel_end > element_start {
                             // Re-render with highlighting
-                            print!("\x1b[{};{}H", term_row + 2, term_col + 1);
+                            print!("\x1b[{};{}H", term_row + 1, term_col + 1);
                             
                             for (i, ch) in element_chars.chars().enumerate() {
                                 let char_pos = element_start + i;
@@ -430,38 +426,7 @@ impl EditableDocument {
         print!("\x1b[7m \x1b[0m"); // Print inverted space as cursor
         io::stdout().execute(cursor::MoveTo(cursor_terminal_col, cursor_terminal_row))?;
         
-        // Calculate status position - find the bottom of document content
-        let max_vpos = self.spatial_map.iter()
-            .map(|e| e.vpos)
-            .fold(0.0, f32::max);
-        let content_bottom = ((max_vpos / 12.0) as u16) + 3;
-        
-        // Get terminal size to ensure status doesn't go off screen
-        let (_terminal_width, terminal_height) = crossterm::terminal::size().unwrap_or((80, 24));
-        let status_row = (content_bottom.max(terminal_height.saturating_sub(2))).min(terminal_height - 1);
-        
-        let cursor_line = self.rope.char_to_line(self.cursor_pos);
-        let cursor_col = self.cursor_pos - self.rope.line_to_char(cursor_line);
-        
-        // Show status at safe bottom position
-        print!("\x1b[{};1H", status_row);
-        print!("📝 Chonker9 Editor (Ropey+Cosmic+Mouse) - Line {}, Col {} ", 
-               cursor_line + 1, cursor_col + 1);
-        
-        if self.selection.active {
-            let (start, end) = self.selection.get_range();
-            let sel_len = end - start;
-            print!("| SEL: {} chars ", sel_len);
-        }
-        
-        print!("| ");
-        if self.save_confirmed { 
-            print!("✅ SAVED | ");
-            self.save_confirmed = false; // Clear after showing once
-        } else if self.modified { 
-            print!("*MODIFIED* | "); 
-        }
-        print!("Click/Drag: Select | Shift+Arrows: Select | Ctrl+A: All | Ctrl+S: Save | Ctrl+Q: Quit");
+        // Clean display - no status bar clutter
         
         io::stdout().flush()?;
         Ok(())

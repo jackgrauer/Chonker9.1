@@ -1,0 +1,21 @@
+[package]
+name = "chonker9"  
+version = "9.1.0"
+edition = "2021"
+
+[dependencies]
+# Terminal UI framework
+crossterm = "0.27"
+
+# HTML parsing for ALTO XML
+quick-xml = "0.38"
+
+# Advanced text editing with rope data structure
+ropey = "1.6"
+
+# Advanced text layout and shaping
+cosmic-text = "0.12"
+
+[[bin]]
+name = "chonker9"
+path = "src/main.rs"
