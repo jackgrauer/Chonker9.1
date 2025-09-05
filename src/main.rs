@@ -1,5 +1,5 @@
 use eframe::egui;
-use std::{process::Command, sync::{Arc, Mutex}};
+use std::{process::Command, sync::{Arc, Mutex}, thread, time::Duration};
 
 #[derive(Debug, Clone)]
 struct SpatialElement {
@@ -297,11 +297,40 @@ impl eframe::App for ChonkerApp {
         // Hot reload with Ctrl+U
         ctx.input(|i| {
             if i.key_pressed(egui::Key::U) && i.modifiers.ctrl {
-                // Bootleg hot reload: quit and restart
-                frame.close();
-                std::process::Command::new("chonker9")
-                    .spawn()
-                    .expect("Failed to restart chonker9");
+                // Bootleg hot reload: quit and restart in right quadrant
+                println!("🔄 Hot reloading...");
+                
+                // Use nohup to properly detach the process
+                let spawn_result = std::process::Command::new("nohup")
+                    .arg("/Users/jack/.local/bin/chonker9")
+                    .arg("--right-quadrant")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                    
+                match spawn_result {
+                    Ok(_) => {
+                        println!("✅ Hot reload spawned with nohup");
+                        thread::sleep(Duration::from_millis(100));
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ nohup spawn failed: {}, trying direct spawn", e);
+                        // Try direct spawn with detached stdio
+                        if let Ok(_) = std::process::Command::new("/Users/jack/.local/bin/chonker9")
+                            .arg("--right-quadrant")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null()) 
+                            .stderr(std::process::Stdio::null())
+                            .spawn() {
+                            println!("✅ Direct spawn succeeded");
+                            thread::sleep(Duration::from_millis(100));
+                            std::process::exit(0);
+                        } else {
+                            eprintln!("❌ All spawn methods failed");
+                        }
+                    }
+                }
             }
         });
         // Top panel with controls
@@ -384,6 +413,10 @@ impl eframe::App for ChonkerApp {
 fn main() -> Result<(), eframe::Error> {
     println!("🚀 Starting Chonker9...");
     
+    // Check for right quadrant positioning argument
+    let args: Vec<String> = std::env::args().collect();
+    let right_quadrant = args.contains(&"--right-quadrant".to_string());
+    
     let mut app = ChonkerApp::default();
     
     // Auto-load the default PDF
@@ -394,14 +427,67 @@ fn main() -> Result<(), eframe::Error> {
         println!("✅ PDF loaded successfully - {} elements", app.spatial_elements.len());
     }
     
+    // Try to detect screen dimensions, fallback to common sizes
+    let (screen_width, screen_height) = {
+        // Try to get screen info via system_profiler (macOS)
+        if let Ok(output) = std::process::Command::new("system_profiler")
+            .args(["SPDisplaysDataType"])
+            .output() {
+            let display_info = String::from_utf8_lossy(&output.stdout);
+            
+            // Parse resolution (this is a rough approach)
+            if let Some(line) = display_info.lines().find(|l| l.contains("Resolution:")) {
+                if let Some(res_part) = line.split("Resolution:").nth(1) {
+                    let parts: Vec<&str> = res_part.split(" x ").collect();
+                    if parts.len() >= 2 {
+                        if let (Ok(w), Ok(h)) = (parts[0].trim().parse::<f32>(), parts[1].split_whitespace().next().unwrap_or("1080").parse::<f32>()) {
+                            println!("📺 Detected screen: {}x{}", w, h);
+                            (w, h)
+                        } else {
+                            println!("📺 Using fallback screen size");
+                            (1920.0, 1080.0)
+                        }
+                    } else {
+                        (1920.0, 1080.0)
+                    }
+                } else {
+                    (1920.0, 1080.0)
+                }
+            } else {
+                (1920.0, 1080.0)
+            }
+        } else {
+            println!("📺 Using default screen size");
+            (1920.0, 1080.0)
+        }
+    };
+    
+    let (window_width, window_height, x_pos, y_pos) = if right_quadrant {
+        // Right HALF of screen, full height, touching bottom
+        let w = screen_width / 2.0;    // Half screen width  
+        let h = screen_height;         // Full screen height (touches bottom)
+        let x = screen_width / 2.0;    // Start exactly at screen center
+        let y = 0.0;                   // Top of screen
+        (w, h, x, y)
+    } else {
+        // Default positioning
+        (1000.0, 700.0, 100.0, 100.0)
+    };
+    
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
+            .with_inner_size([window_width, window_height])
+            .with_position([x_pos, y_pos])
             .with_title("Chonker9 - PDF Editor"),
         ..Default::default()
     };
     
-    println!("🖥️ Creating window...");
+    if right_quadrant {
+        println!("🖥️ Creating window in right half: {}×{} at ({}, {})", window_width, window_height, x_pos, y_pos);
+    } else {
+        println!("🖥️ Creating window...");
+    }
+    
     eframe::run_native(
         "Chonker9",
         options,
