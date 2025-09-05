@@ -189,30 +189,46 @@ impl ChonkerApp {
             line.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
         }
         
-        // Reconstruct readable text
+        // Reconstruct readable text with section spacing
         let mut output = String::new();
+        let mut last_vpos = 0.0;
+        
         for line in lines {
-            let mut line_text = String::new();
-            let mut last_end_pos = 0.0;
-            
-            for element in line {
-                if !line_text.is_empty() {
-                    // Calculate gap between words
-                    let gap = element.hpos - last_end_pos;
-                    if gap > 3.0 {  // Significant gap - add spaces
-                        let spaces = ((gap / 8.0) as usize).min(10).max(1);  // Based on typical char width
-                        line_text.push_str(&" ".repeat(spaces));
-                    } else {
-                        line_text.push(' '); // Normal single space
+            if !line.is_empty() {
+                let current_vpos = line[0].vpos;
+                
+                // Add extra spacing for large vertical gaps (section breaks)
+                if last_vpos > 0.0 {
+                    let vertical_gap = current_vpos - last_vpos;
+                    if vertical_gap > 15.0 {  // Large gap - add extra line breaks
+                        let extra_lines = ((vertical_gap / 12.0) as usize).min(3).max(1);
+                        output.push_str(&"\n".repeat(extra_lines));
                     }
                 }
                 
-                line_text.push_str(&element.content);
-                last_end_pos = element.hpos + element.width;
+                let mut line_text = String::new();
+                let mut last_end_pos = 0.0;
+                
+                for element in line {
+                    if !line_text.is_empty() {
+                        // Calculate gap between words
+                        let gap = element.hpos - last_end_pos;
+                        if gap > 3.0 {  // Significant gap - add spaces
+                            let spaces = ((gap / 8.0) as usize).min(10).max(1);
+                            line_text.push_str(&" ".repeat(spaces));
+                        } else {
+                            line_text.push(' '); // Normal single space
+                        }
+                    }
+                    
+                    line_text.push_str(&element.content);
+                    last_end_pos = element.hpos + element.width;
+                }
+                
+                output.push_str(&line_text);
+                output.push('\n');
+                last_vpos = current_vpos;
             }
-            
-            output.push_str(&line_text);
-            output.push('\n');
         }
         
         output
@@ -230,10 +246,18 @@ impl ChonkerApp {
         // The simple approach that gave good paragraph readability
         let readable_text = self.generate_readable_text();
         
-        ui.add(egui::TextEdit::multiline(&mut readable_text.as_str())
-            .font(egui::TextStyle::Monospace)
-            .desired_width(f32::INFINITY)
-            .desired_rows(30));
+        // Create a very wide text area to prevent viewport wrapping
+        ui.allocate_ui_with_layout(
+            egui::Vec2::new(5000.0, 2000.0),  // Very wide area
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(&readable_text)
+                        .monospace()
+                        .size(12.0)
+                ));  // No wrapping - use wide layout instead
+            }
+        );
     }
     
     fn format_xml(&self) -> String {
@@ -269,7 +293,17 @@ impl ChonkerApp {
 }
 
 impl eframe::App for ChonkerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Hot reload with Ctrl+U
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::U) && i.modifiers.ctrl {
+                // Bootleg hot reload: quit and restart
+                frame.close();
+                std::process::Command::new("chonker9")
+                    .spawn()
+                    .expect("Failed to restart chonker9");
+            }
+        });
         // Top panel with controls
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
