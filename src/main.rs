@@ -242,22 +242,135 @@ impl ChonkerApp {
         self.modified = false;
     }
     
-    fn render_readable_text(&self, ui: &mut egui::Ui) {
-        // The simple approach that gave good paragraph readability
-        let readable_text = self.generate_readable_text();
+    fn render_hybrid_smart(&self, ui: &mut egui::Ui) {
+        let canvas_width = 3000.0;
+        let canvas_height = 2000.0;
         
-        // Create a very wide text area to prevent viewport wrapping
-        ui.allocate_ui_with_layout(
-            egui::Vec2::new(5000.0, 2000.0),  // Very wide area
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(&readable_text)
-                        .monospace()
-                        .size(12.0)
-                ));  // No wrapping - use wide layout instead
-            }
+        let (_response, painter) = ui.allocate_painter(
+            egui::Vec2::new(canvas_width, canvas_height), 
+            egui::Sense::click_and_drag()
         );
+        
+        let scale_x = 1.0;
+        let scale_y = 1.0;
+        
+        // Detect table elements (numbers, currency, short content in columns)
+        let mut table_elements = Vec::new();
+        let mut paragraph_elements = Vec::new();
+        
+        for element in &self.spatial_elements {
+            let content = element.content.trim();
+            
+            // Table detection: numbers, currency, N/A, years
+            if content.len() <= 8 && (
+                content.contains('$') ||
+                content.chars().all(|c| c.is_numeric() || c == '.' || c == '%') ||
+                content == "N/A" ||
+                content.chars().all(|c| c.is_numeric())
+            ) {
+                table_elements.push(element);
+            } else {
+                paragraph_elements.push(element);
+            }
+        }
+        
+        // Render table elements with exact positioning (good for tables)
+        for element in table_elements {
+            let pos = egui::Pos2::new(
+                element.hpos * scale_x,
+                element.vpos * scale_y
+            );
+            
+            painter.text(
+                pos,
+                egui::Align2::LEFT_TOP,
+                &element.content,
+                egui::FontId::monospace(12.0),
+                egui::Color32::from_rgb(150, 255, 150) // Green for tables
+            );
+        }
+        
+        // Render paragraph elements with line reconstruction (good for readability)
+        let readable_text = self.generate_readable_text_from_elements(&paragraph_elements);
+        
+        painter.text(
+            egui::Pos2::new(50.0, 50.0),  // Start position for readable text
+            egui::Align2::LEFT_TOP,
+            &readable_text,
+            egui::FontId::monospace(12.0),
+            egui::Color32::WHITE
+        );
+    }
+    
+    fn generate_readable_text_from_elements(&self, elements: &[&SpatialElement]) -> String {
+        // Same line reconstruction logic but for subset of elements
+        let mut lines: Vec<Vec<&SpatialElement>> = Vec::new();
+        let mut sorted_elements: Vec<&SpatialElement> = elements.iter().cloned().collect();
+        sorted_elements.sort_by(|a, b| a.vpos.partial_cmp(&b.vpos).unwrap());
+        
+        // Group into lines
+        for element in sorted_elements {
+            let found_line = lines.iter_mut().find(|line| {
+                if let Some(first) = line.first() {
+                    (element.vpos - first.vpos).abs() < 8.0
+                } else {
+                    false
+                }
+            });
+            
+            if let Some(line) = found_line {
+                line.push(element);
+            } else {
+                lines.push(vec![element]);
+            }
+        }
+        
+        // Sort within lines and reconstruct
+        for line in &mut lines {
+            line.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
+        }
+        
+        let mut output = String::new();
+        let mut last_vpos = 0.0;
+        
+        for line in lines {
+            if !line.is_empty() {
+                let current_vpos = line[0].vpos;
+                
+                // Add section spacing
+                if last_vpos > 0.0 {
+                    let vertical_gap = current_vpos - last_vpos;
+                    if vertical_gap > 15.0 {
+                        let extra_lines = ((vertical_gap / 12.0) as usize).min(3).max(1);
+                        output.push_str(&"\n".repeat(extra_lines));
+                    }
+                }
+                
+                let mut line_text = String::new();
+                let mut last_end_pos = 0.0;
+                
+                for element in line {
+                    if !line_text.is_empty() {
+                        let gap = element.hpos - last_end_pos;
+                        if gap > 3.0 {
+                            let spaces = ((gap / 8.0) as usize).min(10).max(1);
+                            line_text.push_str(&" ".repeat(spaces));
+                        } else {
+                            line_text.push(' ');
+                        }
+                    }
+                    
+                    line_text.push_str(&element.content);
+                    last_end_pos = element.hpos + element.width;
+                }
+                
+                output.push_str(&line_text);
+                output.push('\n');
+                last_vpos = current_vpos;
+            }
+        }
+        
+        output
     }
     
     fn format_xml(&self) -> String {
@@ -399,8 +512,8 @@ impl eframe::App for ChonkerApp {
                     .auto_shrink([false, false])  // Allow unlimited scrolling
                     .show(ui, |ui| {
                         if !self.spatial_elements.is_empty() {
-                            // Back to basic readable text approach
-                            self.render_readable_text(ui);
+                            // Use hybrid rendering: tables get exact positioning, paragraphs get readability
+                            self.render_hybrid_smart(ui);
                         } else {
                             ui.label("Click '📁 Load PDF' to display content");
                         }
