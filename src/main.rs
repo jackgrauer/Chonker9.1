@@ -61,6 +61,7 @@ impl TerminalMetrics {
 
 #[derive(Debug, Clone)]
 struct SpatialElement {
+    content: String,    // Original ALTO text content
     start_char: usize,  // Position in rope
     end_char: usize,    // End position in rope
     hpos: f32,
@@ -147,6 +148,7 @@ impl EditableDocument {
                 
                 // Create spatial element
                 let spatial_elem = SpatialElement {
+                    content: content.clone(),
                     start_char,
                     end_char,
                     hpos: *hpos,
@@ -262,52 +264,19 @@ impl EditableDocument {
             }
         }
         
-        // Find which line this element belongs to
-        for (line_idx, line_element_indices) in self.lines.iter().enumerate() {
-            if line_element_indices.contains(&best_element_idx) {
-                // Found the line, now find position within it
-                let line_start = self.rope.line_to_char(line_idx);
-                let line = self.rope.line(line_idx);
-                let line_text = line.to_string();
-                
-                // Find approximate character position within the element
-                let mut char_offset = 0;
-                for &elem_idx in line_element_indices {
-                    if elem_idx == best_element_idx {
-                        // We're at the target element
-                        let element_chars: String = line_text.chars()
-                            .skip(char_offset)
-                            .take_while(|&c| c != ' ')
-                            .collect();
-                        
-                        // Position within the element based on horizontal distance
-                        let element_ref = &self.spatial_map[elem_idx];
-                        let relative_x = pdf_x - element_ref.hpos;
-                        let char_width = element_ref.width / element_chars.len() as f32;
-                        let char_pos_in_element = ((relative_x / char_width) as usize).min(element_chars.len());
-                        
-                        return line_start + char_offset + char_pos_in_element;
-                    }
-                    
-                    // Skip this element's characters
-                    let element_chars: String = line_text.chars()
-                        .skip(char_offset)
-                        .take_while(|&c| c != ' ')
-                        .collect();
-                    char_offset += element_chars.len();
-                    
-                    // Skip spaces
-                    while char_offset < line_text.len() && line_text.chars().nth(char_offset) == Some(' ') {
-                        char_offset += 1;
-                    }
-                }
-                
-                return line_start;
-            }
-        }
+        // Use the best element we found
+        let best_element = &self.spatial_map[best_element_idx];
         
-        // Fallback to start of document
-        0
+        // Calculate position within the element based on horizontal distance
+        let relative_x = pdf_x - best_element.hpos;
+        let char_width = if best_element.content.is_empty() { 
+            1.0 
+        } else { 
+            best_element.width / best_element.content.len() as f32 
+        };
+        let char_pos_in_element = ((relative_x / char_width) as usize).min(best_element.content.len());
+        
+        best_element.start_char + char_pos_in_element
     }
     
     fn insert_char(&mut self, c: char) {
@@ -359,64 +328,38 @@ impl EditableDocument {
         // Clean display - no debug clutter
         
         // Render each element individually using absolute PDF coordinates
-        for (line_idx, line_element_indices) in self.lines.iter().enumerate() {
-            let rope_line = self.rope.line(line_idx);
-            let line_text = rope_line.to_string();
-            let line_start = self.rope.line_to_char(line_idx);
-            let line_end = line_start + line_text.chars().count();
+        for elem_idx in 0..self.spatial_map.len() {
+            let element = &self.spatial_map[elem_idx];
             
-            // Track character position within the line
-            let mut char_offset = 0;
+            // Convert PDF coordinates to terminal coordinates using precise measurement
+            let (term_col, term_row) = self.terminal_metrics.pdf_to_terminal(element.hpos, element.vpos);
             
-            for &elem_idx in line_element_indices {
-                let element = &self.spatial_map[elem_idx];
+            // Position cursor using absolute coordinates and print original ALTO content
+            print!("\x1b[{};{}H{}", term_row + 1, term_col + 1, element.content);
+            
+            // Check if cursor should be positioned here
+            if self.cursor_pos >= element.start_char && self.cursor_pos < element.end_char {
+                let char_offset_in_element = self.cursor_pos - element.start_char;
+                cursor_terminal_row = term_row + 1;
+                cursor_terminal_col = term_col + 1 + char_offset_in_element as u16;
+            }
+            
+            // Handle selection highlighting for this element
+            if self.selection.active {
+                let (sel_start, sel_end) = self.selection.get_range();
                 
-                // Convert PDF coordinates to terminal coordinates using precise measurement
-                let (term_col, term_row) = self.terminal_metrics.pdf_to_terminal(element.hpos, element.vpos);
-                
-                // Get the text for this specific element from our original parsing
-                // For now, approximate by extracting characters from the rope line
-                let element_start = line_start + char_offset;
-                let element_chars: String = line_text.chars()
-                    .skip(char_offset)
-                    .take_while(|&c| c != ' ')
-                    .collect();
-                
-                if !element_chars.is_empty() {
-                    // Position cursor using absolute coordinates and print element
-                    print!("\x1b[{};{}H{}", term_row + 1, term_col + 1, element_chars); // Absolute positioning
+                if sel_start < element.end_char && sel_end > element.start_char {
+                    // Re-render with highlighting
+                    print!("\x1b[{};{}H", term_row + 1, term_col + 1);
                     
-                    // Check if cursor should be positioned here
-                    if self.cursor_pos >= element_start && self.cursor_pos < element_start + element_chars.len() {
-                        let char_offset_in_element = self.cursor_pos - element_start;
-                        cursor_terminal_row = term_row + 1;
-                        cursor_terminal_col = term_col + 1 + char_offset_in_element as u16;
-                    }
-                    
-                    // Handle selection highlighting for this element
-                    if self.selection.active {
-                        let (sel_start, sel_end) = self.selection.get_range();
-                        
-                        if sel_start < element_start + element_chars.len() && sel_end > element_start {
-                            // Re-render with highlighting
-                            print!("\x1b[{};{}H", term_row + 1, term_col + 1);
-                            
-                            for (i, ch) in element_chars.chars().enumerate() {
-                                let char_pos = element_start + i;
-                                if char_pos >= sel_start && char_pos < sel_end {
-                                    print!("\x1b[7m{}\x1b[0m", ch); // Highlighted
-                                } else {
-                                    print!("{}", ch); // Normal
-                                }
-                            }
+                    for (i, ch) in element.content.chars().enumerate() {
+                        let char_pos = element.start_char + i;
+                        if char_pos >= sel_start && char_pos < sel_end {
+                            print!("\x1b[7m{}\x1b[0m", ch); // Highlighted
+                        } else {
+                            print!("{}", ch); // Normal
                         }
                     }
-                }
-                
-                // Move to next element (skip spaces)
-                char_offset += element_chars.len();
-                while char_offset < line_text.len() && line_text.chars().nth(char_offset) == Some(' ') {
-                    char_offset += 1;
                 }
             }
         }
