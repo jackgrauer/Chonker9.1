@@ -9,6 +9,57 @@ use ropey::Rope;
 use cosmic_text::{FontSystem, Buffer, Metrics};
 
 #[derive(Debug, Clone)]
+struct TerminalMetrics {
+    cell_width_pts: f32,   // Terminal cell width in points (1/72 inch)
+    cell_height_pts: f32,  // Terminal cell height in points  
+    cols: u16,             // Terminal columns
+    rows: u16,             // Terminal rows
+    dpi: f32,              // Dots per inch for pixel conversion
+}
+
+impl TerminalMetrics {
+    fn new() -> Self {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        
+        // Standard terminal font assumptions:
+        // - Monospace fonts are typically 7-9 pixels wide, 14-16 pixels tall
+        // - At 72 DPI: 1 point = 1 pixel, so cell_width ≈ 8 points, cell_height ≈ 15 points
+        // - This can be refined by detecting terminal font or allowing configuration
+        
+        let dpi = 72.0; // Standard DPI assumption
+        let cell_width_pixels = 8.0;  // Typical terminal cell width in pixels
+        let cell_height_pixels = 15.0; // Typical terminal cell height in pixels
+        
+        Self {
+            cell_width_pts: cell_width_pixels * (72.0 / dpi),
+            cell_height_pts: cell_height_pixels * (72.0 / dpi), 
+            cols,
+            rows,
+            dpi,
+        }
+    }
+    
+    fn pdf_to_terminal(&self, pdf_x: f32, pdf_y: f32) -> (u16, u16) {
+        // Convert PDF coordinates (in points) to terminal grid coordinates
+        let col = (pdf_x / self.cell_width_pts) as u16;
+        let row = (pdf_y / self.cell_height_pts) as u16;
+        
+        // Clamp to terminal bounds
+        let col = col.min(self.cols.saturating_sub(1));
+        let row = row.min(self.rows.saturating_sub(1));
+        
+        (col, row)
+    }
+    
+    fn terminal_to_pdf(&self, col: u16, row: u16) -> (f32, f32) {
+        // Convert terminal coordinates back to PDF coordinates
+        let pdf_x = col as f32 * self.cell_width_pts;
+        let pdf_y = row as f32 * self.cell_height_pts;
+        (pdf_x, pdf_y)
+    }
+}
+
+#[derive(Debug, Clone)]
 struct SpatialElement {
     start_char: usize,  // Position in rope
     end_char: usize,    // End position in rope
@@ -61,6 +112,7 @@ struct EditableDocument {
     lines: Vec<Vec<usize>>,               // Line -> [spatial_element_indices]
     cursor_pos: usize,                    // Cursor position in rope (char index)
     selection: Selection,                 // Text selection state
+    terminal_metrics: TerminalMetrics,    // Terminal measurement system
     modified: bool,
     save_confirmed: bool,
     font_system: FontSystem,
@@ -129,6 +181,7 @@ impl EditableDocument {
             lines,
             cursor_pos: 0,
             selection: Selection::new(),
+            terminal_metrics: TerminalMetrics::new(),
             modified: false,
             save_confirmed: false,
             font_system,
@@ -189,48 +242,72 @@ impl EditableDocument {
     }
     
     fn terminal_to_rope_pos(&self, col: u16, row: u16) -> usize {
-        // Find the line that best matches the clicked row
-        let mut best_line_idx = 0;
-        let mut min_distance = u16::MAX;
+        // Convert terminal click to PDF coordinates
+        let (pdf_x, pdf_y) = self.terminal_metrics.terminal_to_pdf(col, row.saturating_sub(2)); // -2 for debug line
         
+        // Find the closest element to the clicked PDF coordinate
+        let mut best_element_idx = 0;
+        let mut min_distance = f32::MAX;
+        
+        for (elem_idx, element) in self.spatial_map.iter().enumerate() {
+            // Calculate distance from click to element center
+            let elem_center_x = element.hpos + (element.width / 2.0);
+            let elem_center_y = element.vpos + (element.height / 2.0);
+            
+            let distance = ((pdf_x - elem_center_x).powi(2) + (pdf_y - elem_center_y).powi(2)).sqrt();
+            
+            if distance < min_distance {
+                min_distance = distance;
+                best_element_idx = elem_idx;
+            }
+        }
+        
+        // Find which line this element belongs to
         for (line_idx, line_element_indices) in self.lines.iter().enumerate() {
-            if let Some(&first_elem_idx) = line_element_indices.first() {
-                let first_elem = &self.spatial_map[first_elem_idx];
-                let term_row = ((first_elem.vpos / 12.0) as u16).max(1);
-                let distance = if row >= term_row { row - term_row } else { term_row - row };
+            if line_element_indices.contains(&best_element_idx) {
+                // Found the line, now find position within it
+                let line_start = self.rope.line_to_char(line_idx);
+                let line = self.rope.line(line_idx);
+                let line_text = line.to_string();
                 
-                if distance < min_distance {
-                    min_distance = distance;
-                    best_line_idx = line_idx;
+                // Find approximate character position within the element
+                let mut char_offset = 0;
+                for &elem_idx in line_element_indices {
+                    if elem_idx == best_element_idx {
+                        // We're at the target element
+                        let element_chars: String = line_text.chars()
+                            .skip(char_offset)
+                            .take_while(|&c| c != ' ')
+                            .collect();
+                        
+                        // Position within the element based on horizontal distance
+                        let element_ref = &self.spatial_map[elem_idx];
+                        let relative_x = pdf_x - element_ref.hpos;
+                        let char_width = element_ref.width / element_chars.len() as f32;
+                        let char_pos_in_element = ((relative_x / char_width) as usize).min(element_chars.len());
+                        
+                        return line_start + char_offset + char_pos_in_element;
+                    }
+                    
+                    // Skip this element's characters
+                    let element_chars: String = line_text.chars()
+                        .skip(char_offset)
+                        .take_while(|&c| c != ' ')
+                        .collect();
+                    char_offset += element_chars.len();
+                    
+                    // Skip spaces
+                    while char_offset < line_text.len() && line_text.chars().nth(char_offset) == Some(' ') {
+                        char_offset += 1;
+                    }
                 }
+                
+                return line_start;
             }
         }
         
-        // Find position within the line
-        let line_start = self.rope.line_to_char(best_line_idx);
-        let line = self.rope.line(best_line_idx);
-        let line_len = line.len_chars().saturating_sub(1); // Exclude newline
-        
-        // Get spatial info for the line to calculate column offset
-        if let Some(line_element_indices) = self.lines.get(best_line_idx) {
-            if let Some(&first_elem_idx) = line_element_indices.first() {
-                let first_elem = &self.spatial_map[first_elem_idx];
-                let term_col_start = ((first_elem.hpos / 8.0) as u16).max(1);
-                
-                // Calculate approximate character position based on click column
-                let clicked_col_offset = if col >= term_col_start { 
-                    col - term_col_start 
-                } else { 
-                    0 
-                };
-                
-                let char_pos = (clicked_col_offset as usize).min(line_len);
-                return line_start + char_pos;
-            }
-        }
-        
-        // Fallback to line start
-        line_start
+        // Fallback to start of document
+        0
     }
     
     fn insert_char(&mut self, c: char) {
@@ -265,6 +342,9 @@ impl EditableDocument {
         // Clear screen and home cursor
         io::stdout().execute(Clear(ClearType::All))?.execute(cursor::MoveTo(0, 0))?;
         
+        // Update terminal metrics in case of resize
+        self.terminal_metrics = TerminalMetrics::new();
+        
         // Use cosmic-text for advanced text shaping and layout
         self.cosmic_buffer.shape_until_scroll(&mut self.font_system, false);
         
@@ -276,55 +356,71 @@ impl EditableDocument {
         let mut cursor_terminal_row = 1;
         let mut cursor_terminal_col = 1;
         
-        // Render each line using spatial information where available
+        // Print debug info about coordinate system
+        print!("\x1b[1;1H📏 Terminal: {}x{} | Cell: {:.1}x{:.1}pts | DPI: {:.0}", 
+               self.terminal_metrics.cols, self.terminal_metrics.rows,
+               self.terminal_metrics.cell_width_pts, self.terminal_metrics.cell_height_pts,
+               self.terminal_metrics.dpi);
+        
+        // Render each element individually using absolute PDF coordinates
         for (line_idx, line_element_indices) in self.lines.iter().enumerate() {
-            if line_element_indices.is_empty() { continue; }
-            
             let rope_line = self.rope.line(line_idx);
-            let line_text = rope_line.to_string().trim_end().to_string();
+            let line_text = rope_line.to_string();
+            let line_start = self.rope.line_to_char(line_idx);
+            let line_end = line_start + line_text.chars().count();
             
-            // Get spatial info from first element for positioning
-            if let Some(&first_elem_idx) = line_element_indices.first() {
-                let first_elem = &self.spatial_map[first_elem_idx];
+            // Track character position within the line
+            let mut char_offset = 0;
+            
+            for &elem_idx in line_element_indices {
+                let element = &self.spatial_map[elem_idx];
                 
-                // Calculate terminal position
-                let term_row = ((first_elem.vpos / 12.0) as u16).max(1);
-                let term_col = ((first_elem.hpos / 8.0) as u16).max(1);
+                // Convert PDF coordinates to terminal coordinates using precise measurement
+                let (term_col, term_row) = self.terminal_metrics.pdf_to_terminal(element.hpos, element.vpos);
                 
-                // Calculate line range in rope
-                let line_start = self.rope.line_to_char(line_idx);
-                let line_end = line_start + line_text.chars().count();
+                // Get the text for this specific element from our original parsing
+                // For now, approximate by extracting characters from the rope line
+                let element_start = line_start + char_offset;
+                let element_chars: String = line_text.chars()
+                    .skip(char_offset)
+                    .take_while(|&c| c != ' ')
+                    .collect();
                 
-                // Check if this line has selection
-                if self.selection.active {
-                    let (sel_start, sel_end) = self.selection.get_range();
+                if !element_chars.is_empty() {
+                    // Position cursor using absolute coordinates and print element
+                    print!("\x1b[{};{}H{}", term_row + 2, term_col + 1, element_chars); // +2 to avoid debug line
                     
-                    // If line intersects with selection, render with highlighting
-                    if sel_start < line_end && sel_end > line_start {
-                        print!("\x1b[{};{}H", term_row, term_col);
+                    // Check if cursor should be positioned here
+                    if self.cursor_pos >= element_start && self.cursor_pos < element_start + element_chars.len() {
+                        let char_offset_in_element = self.cursor_pos - element_start;
+                        cursor_terminal_row = term_row + 2;
+                        cursor_terminal_col = term_col + 1 + char_offset_in_element as u16;
+                    }
+                    
+                    // Handle selection highlighting for this element
+                    if self.selection.active {
+                        let (sel_start, sel_end) = self.selection.get_range();
                         
-                        for (char_idx, ch) in line_text.chars().enumerate() {
-                            let char_pos = line_start + char_idx;
+                        if sel_start < element_start + element_chars.len() && sel_end > element_start {
+                            // Re-render with highlighting
+                            print!("\x1b[{};{}H", term_row + 2, term_col + 1);
                             
-                            if char_pos >= sel_start && char_pos < sel_end {
-                                print!("\x1b[7m{}\x1b[0m", ch); // Highlighted character
-                            } else {
-                                print!("{}", ch); // Normal character
+                            for (i, ch) in element_chars.chars().enumerate() {
+                                let char_pos = element_start + i;
+                                if char_pos >= sel_start && char_pos < sel_end {
+                                    print!("\x1b[7m{}\x1b[0m", ch); // Highlighted
+                                } else {
+                                    print!("{}", ch); // Normal
+                                }
                             }
                         }
-                    } else {
-                        // No selection on this line
-                        print!("\x1b[{};{}H{}", term_row, term_col, line_text);
                     }
-                } else {
-                    // No active selection
-                    print!("\x1b[{};{}H{}", term_row, term_col, line_text);
                 }
                 
-                // Calculate cursor position if this is the active line
-                if line_idx == cursor_line {
-                    cursor_terminal_row = term_row;
-                    cursor_terminal_col = term_col + cursor_col as u16;
+                // Move to next element (skip spaces)
+                char_offset += element_chars.len();
+                while char_offset < line_text.len() && line_text.chars().nth(char_offset) == Some(' ') {
+                    char_offset += 1;
                 }
             }
         }
