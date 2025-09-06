@@ -237,10 +237,10 @@ impl ChonkerApp {
                 
                 for element in line {
                     if !line_text.is_empty() {
-                        // Calculate gap between words
+                        // Better spacing calculation for good kerning
                         let gap = element.hpos - last_end_pos;
-                        if gap > 3.0 {  // Significant gap - add spaces
-                            let spaces = ((gap / 8.0) as usize).min(10).max(1);
+                        if gap > 6.0 {  // Large gap - multiple spaces
+                            let spaces = ((gap / 6.0) as usize).min(8).max(2);
                             line_text.push_str(&" ".repeat(spaces));
                         } else {
                             line_text.push(' '); // Normal single space
@@ -708,8 +708,8 @@ impl ChonkerApp {
                         egui::FontId::monospace(12.0), egui::Color32::from_rgb(150, 255, 150));
         }
         
-        // Render paragraphs using LIVE text from spatial buffer (this is the key!)
-        self.render_live_paragraph_text(&painter, scale_x, scale_y);
+        // Render live editable text in readable format (not individual elements)
+        self.render_live_readable_paragraphs(&painter, scale_x, scale_y);
         
         // WYSIWYG cursor and editing
         if response.clicked() {
@@ -757,6 +757,44 @@ impl ChonkerApp {
                 }
             }
         });
+    }
+    
+    fn render_live_readable_paragraphs(&self, painter: &egui::Painter, scale_x: f32, scale_y: f32) {
+        // Show the live edited rope content in readable format (white text that responds to edits)
+        let live_text = self.spatial_buffer.rope.to_string();
+        
+        // Find the starting position (use first non-table element)
+        let mut start_pos = egui::Pos2::new(100.0, 100.0); // Default position
+        for element in &self.spatial_elements {
+            let content = element.content.trim();
+            let is_in_table_region = element.vpos >= 409.0 && element.vpos <= 517.0;
+            let is_table_content = content.contains('$') ||
+                                  content == "N/A" ||
+                                  content.contains('%') ||
+                                  (content.chars().all(|c| c.is_numeric()) && content.len() == 4);
+            
+            if !(is_in_table_region && is_table_content) {
+                start_pos = egui::Pos2::new(element.hpos * scale_x, element.vpos * scale_y);
+                break;
+            }
+        }
+        
+        // Format live text with line breaks for readability
+        let formatted_text = live_text
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(80) // Break into 80-character lines
+            .map(|chunk| chunk.iter().collect::<String>())
+            .collect::<Vec<String>>()
+            .join("\n");
+        
+        painter.text(
+            start_pos,
+            egui::Align2::LEFT_TOP,
+            &formatted_text,
+            egui::FontId::monospace(12.0),
+            egui::Color32::WHITE
+        );
     }
     
     fn render_live_paragraph_text(&self, painter: &egui::Painter, scale_x: f32, scale_y: f32) {
@@ -923,11 +961,6 @@ impl eframe::App for ChonkerApp {
                     self.show_xml_debug = !self.show_xml_debug;
                 }
                 
-                ui.separator();
-                
-                if ui.button(if self.wysiwyg_mode { "📝 WYSIWYG Mode" } else { "👁️ Display Mode" }).clicked() {
-                    self.wysiwyg_mode = !self.wysiwyg_mode;
-                }
                 
                 if self.show_xml_debug {
                     ui.label("📋 Debug Mode");
@@ -938,16 +971,10 @@ impl eframe::App for ChonkerApp {
                     }
                 } else {
                     if ui.button("💾 Save Text").clicked() {
-                        let content = self.rope.to_string();
+                        let content = self.spatial_buffer.rope.to_string();
                         if let Err(e) = std::fs::write("chonker9_edited.txt", content) {
                             eprintln!("Error saving text: {}", e);
                         }
-                    }
-                    
-                    // Show edit status
-                    if let Some(elem_idx) = self.editing_element {
-                        ui.label(format!("✏️ Editing element {}: '{}'", elem_idx, 
-                            self.spatial_elements[elem_idx].content.chars().take(20).collect::<String>()));
                     }
                 }
             });
@@ -986,13 +1013,8 @@ impl eframe::App for ChonkerApp {
                     .auto_shrink([false, false])  // Allow unlimited scrolling
                     .show(ui, |ui| {
                         if !self.spatial_elements.is_empty() {
-                            if self.wysiwyg_mode {
-                                // Use WYSIWYG mode with readable paragraph rendering + accurate cursor
-                                self.render_wysiwyg_readable(ui);
-                            } else {
-                                // Use readable text display (the one that worked)
-                                self.render_readable_display(ui);
-                            }
+                            // Always use WYSIWYG spatial editing mode
+                            self.render_wysiwyg_readable(ui);
                         } else {
                             ui.label("Click '📁 Load PDF' to display content");
                         }
@@ -1000,54 +1022,7 @@ impl eframe::App for ChonkerApp {
             }
         });
         
-        // Show inline editor popup when editing an element (only in display mode)
-        if !self.wysiwyg_mode {
-            if let Some(elem_idx) = self.editing_element {
-            egui::Window::new("✏️ Edit Element")
-                .default_size([400.0, 150.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("Editing: '{}'", self.spatial_elements[elem_idx].content));
-                    ui.separator();
-                    
-                    // Text input
-                    let text_edit = ui.add(egui::TextEdit::singleline(&mut self.edit_text)
-                        .desired_width(f32::INFINITY));
-                    
-                    // Auto-focus the text input
-                    if !text_edit.has_focus() {
-                        text_edit.request_focus();
-                    }
-                    
-                    ui.horizontal(|ui| {
-                        if ui.button("✅ Save").clicked() {
-                            // Save the edited text back to the element
-                            self.spatial_elements[elem_idx].content = self.edit_text.clone();
-                            self.editing_element = None;
-                            self.edit_text.clear();
-                        }
-                        
-                        if ui.button("❌ Cancel").clicked() {
-                            // Cancel editing
-                            self.editing_element = None;
-                            self.edit_text.clear();
-                        }
-                    });
-                    
-                    // Handle Enter key to save
-                    if text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        self.spatial_elements[elem_idx].content = self.edit_text.clone();
-                        self.editing_element = None;
-                        self.edit_text.clear();
-                    }
-                    
-                    // Handle Escape to cancel
-                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        self.editing_element = None;
-                        self.edit_text.clear();
-                    }
-                });
-            }
-        }
+        // Pure WYSIWYG spatial editing - no popups needed
     }
 }
 
