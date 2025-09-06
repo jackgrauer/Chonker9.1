@@ -68,6 +68,11 @@ impl Default for ChonkerApp {
 
 impl ChonkerApp {
     fn load_pdf(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Check if PDF file exists
+        if !std::path::Path::new(&self.pdf_path).exists() {
+            return Err(format!("PDF file not found: {}", self.pdf_path).into());
+        }
+        
         // Extract PDF using pdfalto
         let output = Command::new("pdfalto")
             .args([
@@ -261,13 +266,14 @@ impl ChonkerApp {
         for element in &self.spatial_elements {
             let content = element.content.trim();
             
-            // Table detection: numbers, currency, N/A, years
-            if content.len() <= 8 && (
-                content.contains('$') ||
-                content.chars().all(|c| c.is_numeric() || c == '.' || c == '%') ||
-                content == "N/A" ||
-                content.chars().all(|c| c.is_numeric())
-            ) {
+            // More precise table detection: actual table region VPOS 409-517
+            let is_in_table_region = element.vpos >= 409.0 && element.vpos <= 517.0;
+            let is_table_content = content.contains('$') ||           // Currency values
+                                  content == "N/A" ||                // Table placeholders  
+                                  content.contains('%') ||           // Percentages
+                                  (content.chars().all(|c| c.is_numeric()) && content.len() == 4); // Years like 2011, 2012
+            
+            if is_in_table_region && is_table_content {
                 table_elements.push(element);
             } else {
                 paragraph_elements.push(element);
@@ -534,46 +540,20 @@ fn main() -> Result<(), eframe::Error> {
     
     // Auto-load the default PDF
     println!("📁 Loading PDF...");
-    if let Err(e) = app.load_pdf() {
-        eprintln!("Error auto-loading PDF: {}", e);
-    } else {
-        println!("✅ PDF loaded successfully - {} elements", app.spatial_elements.len());
+    match app.load_pdf() {
+        Ok(()) => {
+            println!("✅ PDF loaded successfully - {} elements", app.spatial_elements.len());
+        }
+        Err(e) => {
+            eprintln!("❌ Error loading PDF: {}", e);
+            eprintln!("💡 Continuing without PDF data - you can load one manually");
+        }
     }
     
-    // Try to detect screen dimensions, fallback to common sizes
-    let (screen_width, screen_height) = {
-        // Try to get screen info via system_profiler (macOS)
-        if let Ok(output) = std::process::Command::new("system_profiler")
-            .args(["SPDisplaysDataType"])
-            .output() {
-            let display_info = String::from_utf8_lossy(&output.stdout);
-            
-            // Parse resolution (this is a rough approach)
-            if let Some(line) = display_info.lines().find(|l| l.contains("Resolution:")) {
-                if let Some(res_part) = line.split("Resolution:").nth(1) {
-                    let parts: Vec<&str> = res_part.split(" x ").collect();
-                    if parts.len() >= 2 {
-                        if let (Ok(w), Ok(h)) = (parts[0].trim().parse::<f32>(), parts[1].split_whitespace().next().unwrap_or("1080").parse::<f32>()) {
-                            println!("📺 Detected screen: {}x{}", w, h);
-                            (w, h)
-                        } else {
-                            println!("📺 Using fallback screen size");
-                            (1920.0, 1080.0)
-                        }
-                    } else {
-                        (1920.0, 1080.0)
-                    }
-                } else {
-                    (1920.0, 1080.0)
-                }
-            } else {
-                (1920.0, 1080.0)
-            }
-        } else {
-            println!("📺 Using default screen size");
-            (1920.0, 1080.0)
-        }
-    };
+    // Use fixed screen dimensions to avoid system calls that might cause issues
+    let screen_width = 1920.0;
+    let screen_height = 1080.0;
+    println!("📺 Using default screen size: {}x{}", screen_width, screen_height);
     
     let (window_width, window_height, x_pos, y_pos) = if right_quadrant {
         // Right HALF of screen, full height, touching bottom
