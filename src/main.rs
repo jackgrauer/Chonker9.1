@@ -1,6 +1,9 @@
 use eframe::egui;
 use std::{process::Command, sync::{Arc, Mutex}, thread, time::Duration};
 
+mod spatial_text;
+use spatial_text::{SpatialTextBuffer, SpatialCursor, ElementRange};
+
 #[derive(Debug, Clone)]
 struct SpatialElement {
     content: String,
@@ -45,6 +48,13 @@ struct ChonkerApp {
     selection_start: Option<usize>,
     selection_end: Option<usize>,
     modified: bool,
+    // Click-to-edit state
+    editing_element: Option<usize>,  // Which element is being edited
+    edit_text: String,               // Current edit text
+    // WYSIWYG spatial editing system
+    spatial_buffer: SpatialTextBuffer,
+    spatial_cursor: SpatialCursor,
+    wysiwyg_mode: bool,              // Toggle between old and new system
 }
 
 impl Default for ChonkerApp {
@@ -62,6 +72,11 @@ impl Default for ChonkerApp {
             selection_start: None,
             selection_end: None,
             modified: false,
+            editing_element: None,
+            edit_text: String::new(),
+            spatial_buffer: SpatialTextBuffer::new(),
+            spatial_cursor: SpatialCursor::new(),
+            wysiwyg_mode: false,
         }
     }
 }
@@ -92,6 +107,12 @@ impl ChonkerApp {
         self.raw_xml = String::from_utf8_lossy(&output.stdout).to_string();
         self.parse_spatial_elements()?;
         self.build_rope_from_elements();
+        
+        // Initialize WYSIWYG spatial buffer
+        let elements_for_spatial: Vec<(String, f32, f32, f32, f32)> = self.spatial_elements.iter()
+            .map(|e| (e.content.clone(), e.hpos, e.vpos, e.width, e.height))
+            .collect();
+        self.spatial_buffer = SpatialTextBuffer::from_alto_elements(&elements_for_spatial);
         
         Ok(())
     }
@@ -247,17 +268,18 @@ impl ChonkerApp {
         self.modified = false;
     }
     
-    fn render_hybrid_smart(&self, ui: &mut egui::Ui) {
+    fn render_hybrid_smart(&mut self, ui: &mut egui::Ui) {
         let canvas_width = 3000.0;
         let canvas_height = 2000.0;
         
-        let (_response, painter) = ui.allocate_painter(
+        let (response, painter) = ui.allocate_painter(
             egui::Vec2::new(canvas_width, canvas_height), 
             egui::Sense::click_and_drag()
         );
         
-        let scale_x = 1.0;
-        let scale_y = 1.0;
+        // ALTO coordinates are in points (1/72 inch), need to scale for pixel display
+        let scale_x = 1.2;  // Slightly expand horizontal for readability
+        let scale_y = 1.0;  // Keep vertical as-is
         
         // Detect table elements (numbers, currency, short content in columns)
         let mut table_elements = Vec::new();
@@ -296,16 +318,38 @@ impl ChonkerApp {
             );
         }
         
-        // Render paragraph elements with line reconstruction (good for readability)
-        let readable_text = self.generate_readable_text_from_elements(&paragraph_elements);
+        // Render paragraph elements with automatic spacing to prevent jumbling
+        for element in paragraph_elements {
+            let pos = egui::Pos2::new(
+                element.hpos * scale_x,
+                element.vpos * scale_y
+            );
+            
+            // Add a space after each word to prevent jumbling
+            let spaced_content = format!("{} ", element.content);
+            
+            painter.text(
+                pos,
+                egui::Align2::LEFT_TOP,
+                &spaced_content,
+                egui::FontId::monospace(12.0),
+                egui::Color32::WHITE
+            );
+        }
         
-        painter.text(
-            egui::Pos2::new(50.0, 50.0),  // Start position for readable text
-            egui::Align2::LEFT_TOP,
-            &readable_text,
-            egui::FontId::monospace(12.0),
-            egui::Color32::WHITE
-        );
+        // Handle clicks for editing
+        if response.clicked() {
+            if let Some(click_pos) = response.interact_pointer_pos() {
+                // Find which element was clicked
+                let clicked_element = self.find_element_at_position(click_pos, scale_x, scale_y);
+                if let Some(elem_idx) = clicked_element {
+                    // Start editing this element
+                    self.editing_element = Some(elem_idx);
+                    self.edit_text = self.spatial_elements[elem_idx].content.clone();
+                    self.modified = true;
+                }
+            }
+        }
     }
     
     fn generate_readable_text_from_elements(&self, elements: &[&SpatialElement]) -> String {
@@ -377,6 +421,418 @@ impl ChonkerApp {
         }
         
         output
+    }
+    
+    fn render_paragraphs_with_positioning(&self, elements: &[&SpatialElement], painter: &egui::Painter, scale_x: f32, scale_y: f32) {
+        // Group elements into lines but preserve horizontal positioning
+        let mut lines: Vec<Vec<&SpatialElement>> = Vec::new();
+        let mut sorted_elements: Vec<&SpatialElement> = elements.iter().cloned().collect();
+        sorted_elements.sort_by(|a, b| a.vpos.partial_cmp(&b.vpos).unwrap());
+        
+        // Group into lines (within 8 pixels vertically)
+        for element in sorted_elements {
+            let found_line = lines.iter_mut().find(|line| {
+                if let Some(first) = line.first() {
+                    (element.vpos - first.vpos).abs() < 8.0
+                } else {
+                    false
+                }
+            });
+            
+            if let Some(line) = found_line {
+                line.push(element);
+            } else {
+                lines.push(vec![element]);
+            }
+        }
+        
+        // Render each line at its proper position with spacing
+        for line in lines {
+            if line.is_empty() { continue; }
+            
+            let mut sorted_line = line.clone();
+            sorted_line.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
+            
+            // Use the leftmost element's position as the line start
+            let line_y = sorted_line[0].vpos * scale_y;
+            let line_x = sorted_line[0].hpos * scale_x;  // Start at actual left margin
+            
+            // Build line text with proper spacing
+            let mut line_text = String::new();
+            let mut last_end_pos = 0.0;
+            
+            for element in sorted_line {
+                if !line_text.is_empty() {
+                    let gap = element.hpos - last_end_pos;
+                    if gap > 3.0 {
+                        let spaces = ((gap / 8.0) as usize).min(10).max(1);
+                        line_text.push_str(&" ".repeat(spaces));
+                    } else {
+                        line_text.push(' ');
+                    }
+                }
+                
+                line_text.push_str(&element.content);
+                last_end_pos = element.hpos + element.width;
+            }
+            
+            // Render the line at its proper horizontal position
+            painter.text(
+                egui::Pos2::new(line_x, line_y),
+                egui::Align2::LEFT_TOP,
+                &line_text,
+                egui::FontId::monospace(12.0),
+                egui::Color32::WHITE
+            );
+        }
+    }
+    
+    fn render_spaced_elements(&self, elements: &[&SpatialElement], painter: &egui::Painter, scale_x: f32, scale_y: f32, color: egui::Color32) {
+        // Group elements by line (same VPOS) to add proper spacing
+        let mut lines: std::collections::HashMap<i32, Vec<&SpatialElement>> = std::collections::HashMap::new();
+        
+        // Group elements by vertical position (rounded to handle minor variations)
+        for element in elements {
+            let vpos_key = (element.vpos * scale_y) as i32;
+            lines.entry(vpos_key).or_insert_with(Vec::new).push(element);
+        }
+        
+        // Render each line with proper spacing
+        for (_vpos, mut line_elements) in lines {
+            // Sort by horizontal position
+            line_elements.sort_by(|a, b| a.hpos.partial_cmp(&b.hpos).unwrap());
+            
+            // Render each element with spacing consideration
+            for (i, element) in line_elements.iter().enumerate() {
+                let mut display_content = element.content.clone();
+                
+                // Add space after element if there's a significant gap to the next element
+                if i < line_elements.len() - 1 {
+                    let next_element = line_elements[i + 1];
+                    let gap = next_element.hpos - (element.hpos + element.width);
+                    
+                    // If there's a significant gap (>3 pixels), add spaces
+                    if gap > 3.0 {
+                        let spaces_needed = ((gap / 8.0) as usize).min(10).max(1);
+                        display_content.push_str(&" ".repeat(spaces_needed));
+                    } else {
+                        display_content.push(' '); // Single space for normal word separation
+                    }
+                }
+                
+                // Render at exact ALTO position
+                let pos = egui::Pos2::new(
+                    element.hpos * scale_x,
+                    element.vpos * scale_y
+                );
+                
+                painter.text(
+                    pos,
+                    egui::Align2::LEFT_TOP,
+                    &display_content,
+                    egui::FontId::monospace(12.0),
+                    color
+                );
+            }
+        }
+    }
+    
+    fn find_element_at_position(&self, click_pos: egui::Pos2, scale_x: f32, scale_y: f32) -> Option<usize> {
+        // Find the closest element to the click position
+        let mut closest_distance = f32::MAX;
+        let mut closest_element = None;
+        
+        for (i, element) in self.spatial_elements.iter().enumerate() {
+            // Calculate element's screen position
+            let element_pos = egui::Pos2::new(
+                element.hpos * scale_x,
+                element.vpos * scale_y
+            );
+            let element_size = egui::Vec2::new(element.width * scale_x, 20.0); // Assume ~20px height
+            let element_rect = egui::Rect::from_min_size(element_pos, element_size);
+            
+            // Check if click is within element bounds
+            if element_rect.contains(click_pos) {
+                return Some(i);
+            }
+            
+            // Otherwise, find closest element
+            let distance = click_pos.distance(element_pos);
+            if distance < closest_distance {
+                closest_distance = distance;
+                closest_element = Some(i);
+            }
+        }
+        
+        // Return closest element if click was reasonably close (within 50 pixels)
+        if closest_distance < 50.0 {
+            closest_element
+        } else {
+            None
+        }
+    }
+    
+    fn render_wysiwyg_mode(&mut self, ui: &mut egui::Ui) {
+        let canvas_width = 3000.0;
+        let canvas_height = 2000.0;
+        
+        let (response, painter) = ui.allocate_painter(
+            egui::Vec2::new(canvas_width, canvas_height), 
+            egui::Sense::click_and_drag()
+        );
+        
+        // Handle clicks for cursor positioning
+        if response.clicked() {
+            if let Some(click_pos) = response.interact_pointer_pos() {
+                self.spatial_cursor.move_to_screen_position(click_pos, &self.spatial_buffer);
+            }
+        }
+        
+        // Render each element using current rope content at exact ALTO positions
+        for (_i, element_range) in self.spatial_buffer.element_ranges.iter().enumerate() {
+            // Get current text from rope (this is the key - live text, not original)
+            let current_text = if element_range.rope_start < self.spatial_buffer.rope.len_chars() {
+                self.spatial_buffer.rope.slice(element_range.rope_start..element_range.rope_end.min(self.spatial_buffer.rope.len_chars())).to_string()
+            } else {
+                String::new()
+            };
+            
+            // Render at exact ALTO coordinates (no zoom/pan for now - keep it simple)
+            let pos = egui::Pos2::new(
+                element_range.visual_bounds.min.x,
+                element_range.visual_bounds.min.y
+            );
+            
+            // Render text at spatial position
+            if !current_text.is_empty() {
+                painter.text(
+                    pos,
+                    egui::Align2::LEFT_TOP,
+                    &current_text,
+                    egui::FontId::monospace(12.0),
+                    if element_range.modified { 
+                        egui::Color32::from_rgb(255, 200, 100) // Orange for modified
+                    } else { 
+                        egui::Color32::WHITE 
+                    }
+                );
+            }
+            
+            // Show bounds if element is overflowing
+            if element_range.overflow {
+                let bounds_rect = egui::Rect::from_min_size(pos, 
+                    egui::Vec2::new(element_range.visual_bounds.width(), 15.0));
+                painter.rect_stroke(bounds_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::RED));
+            }
+        }
+        
+        // Update and render cursor
+        self.spatial_cursor.update_position(&self.spatial_buffer);
+        self.spatial_cursor.render(&painter);
+        
+        // Handle keyboard input for text editing
+        ui.input(|i| {
+            // Handle text input
+            for event in &i.events {
+                match event {
+                    egui::Event::Text(text) => {
+                        // Insert text at current cursor position
+                        self.spatial_buffer.insert_text(self.spatial_cursor.rope_pos, text);
+                        self.spatial_cursor.rope_pos += text.chars().count();
+                        self.modified = true;
+                    }
+                    egui::Event::Key { key, pressed: true, .. } => {
+                        match key {
+                            egui::Key::Backspace => {
+                                if self.spatial_cursor.rope_pos > 0 {
+                                    self.spatial_buffer.delete_range(self.spatial_cursor.rope_pos - 1, self.spatial_cursor.rope_pos);
+                                    self.spatial_cursor.rope_pos -= 1;
+                                    self.modified = true;
+                                }
+                            }
+                            egui::Key::ArrowLeft => {
+                                if self.spatial_cursor.rope_pos > 0 {
+                                    self.spatial_cursor.rope_pos -= 1;
+                                }
+                            }
+                            egui::Key::ArrowRight => {
+                                if self.spatial_cursor.rope_pos < self.spatial_buffer.rope.len_chars() {
+                                    self.spatial_cursor.rope_pos += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    
+    fn render_wysiwyg_readable(&mut self, ui: &mut egui::Ui) {
+        // Combine readable paragraph rendering with WYSIWYG cursor positioning
+        let canvas_width = 3000.0;
+        let canvas_height = 2000.0;
+        
+        let (response, painter) = ui.allocate_painter(
+            egui::Vec2::new(canvas_width, canvas_height), 
+            egui::Sense::click_and_drag()
+        );
+        
+        let scale_x = 1.2;
+        let scale_y = 1.0;
+        
+        // Use the readable paragraph rendering approach
+        let mut table_elements = Vec::new();
+        let mut paragraph_elements = Vec::new();
+        
+        for element in &self.spatial_elements {
+            let content = element.content.trim();
+            let is_in_table_region = element.vpos >= 409.0 && element.vpos <= 517.0;
+            let is_table_content = content.contains('$') ||
+                                  content == "N/A" ||
+                                  content.contains('%') ||
+                                  (content.chars().all(|c| c.is_numeric()) && content.len() == 4);
+            
+            if is_in_table_region && is_table_content {
+                table_elements.push(element);
+            } else {
+                paragraph_elements.push(element);
+            }
+        }
+        
+        // Render table elements (green)
+        for element in table_elements {
+            let pos = egui::Pos2::new(element.hpos * scale_x, element.vpos * scale_y);
+            painter.text(pos, egui::Align2::LEFT_TOP, &element.content, 
+                        egui::FontId::monospace(12.0), egui::Color32::from_rgb(150, 255, 150));
+        }
+        
+        // Render paragraphs using LIVE text from spatial buffer (this is the key!)
+        self.render_live_paragraph_text(&painter, scale_x, scale_y);
+        
+        // WYSIWYG cursor and editing
+        if response.clicked() {
+            if let Some(click_pos) = response.interact_pointer_pos() {
+                if let Some(rope_pos) = self.spatial_buffer.screen_to_rope_position(click_pos) {
+                    self.spatial_cursor.rope_pos = rope_pos;
+                }
+            }
+        }
+        
+        // Update and render cursor
+        self.spatial_cursor.update_position(&self.spatial_buffer);
+        self.spatial_cursor.render(&painter);
+        
+        // Handle text editing
+        ui.input(|i| {
+            for event in &i.events {
+                match event {
+                    egui::Event::Text(text) => {
+                        self.spatial_buffer.insert_text(self.spatial_cursor.rope_pos, text);
+                        self.spatial_cursor.rope_pos += text.chars().count();
+                        self.modified = true;
+                    }
+                    egui::Event::Key { key, pressed: true, .. } => {
+                        match key {
+                            egui::Key::Backspace => {
+                                if self.spatial_cursor.rope_pos > 0 {
+                                    self.spatial_buffer.delete_range(self.spatial_cursor.rope_pos - 1, self.spatial_cursor.rope_pos);
+                                    self.spatial_cursor.rope_pos -= 1;
+                                    self.modified = true;
+                                }
+                            }
+                            egui::Key::ArrowLeft => {
+                                if self.spatial_cursor.rope_pos > 0 { self.spatial_cursor.rope_pos -= 1; }
+                            }
+                            egui::Key::ArrowRight => {
+                                if self.spatial_cursor.rope_pos < self.spatial_buffer.rope.len_chars() { 
+                                    self.spatial_cursor.rope_pos += 1; 
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    
+    fn render_live_paragraph_text(&self, painter: &egui::Painter, scale_x: f32, scale_y: f32) {
+        // Render the current rope content using spatial positioning
+        // This shows the LIVE edited text, not the original ALTO text
+        
+        for element_range in &self.spatial_buffer.element_ranges {
+            // Skip table elements (they're handled separately)
+            if let Some(original_element) = self.spatial_elements.get(element_range.element_id) {
+                let content = original_element.content.trim();
+                let is_in_table_region = original_element.vpos >= 409.0 && original_element.vpos <= 517.0;
+                let is_table_content = content.contains('$') ||
+                                      content == "N/A" ||
+                                      content.contains('%') ||
+                                      (content.chars().all(|c| c.is_numeric()) && content.len() == 4);
+                
+                if is_in_table_region && is_table_content {
+                    continue; // Skip table elements
+                }
+            }
+            
+            // Get the current text from the spatial buffer (edited content)
+            let current_text = if element_range.rope_start < self.spatial_buffer.rope.len_chars() {
+                self.spatial_buffer.rope.slice(element_range.rope_start..element_range.rope_end.min(self.spatial_buffer.rope.len_chars())).to_string()
+            } else {
+                String::new()
+            };
+            
+            if !current_text.is_empty() {
+                let pos = egui::Pos2::new(
+                    element_range.visual_bounds.min.x * scale_x,
+                    element_range.visual_bounds.min.y * scale_y
+                );
+                
+                painter.text(
+                    pos,
+                    egui::Align2::LEFT_TOP,
+                    &current_text,
+                    egui::FontId::monospace(12.0),
+                    if element_range.modified {
+                        egui::Color32::from_rgb(255, 200, 100) // Orange for edited
+                    } else {
+                        egui::Color32::WHITE
+                    }
+                );
+            }
+        }
+    }
+    
+    fn render_readable_display(&mut self, ui: &mut egui::Ui) {
+        // Use the old readable text approach that worked well
+        let readable_text = self.generate_readable_text();
+        
+        ui.allocate_ui_with_layout(
+            egui::Vec2::new(5000.0, 2000.0),  // Very wide area
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(&readable_text)
+                        .monospace()
+                        .size(12.0)
+                ));
+            }
+        );
+        
+        // Handle clicks for popup editing (old system)
+        if ui.input(|i| i.pointer.any_click()) {
+            if let Some(click_pos) = ui.input(|i| i.pointer.interact_pos()) {
+                let clicked_element = self.find_element_at_position(click_pos, 1.2, 1.0);
+                if let Some(elem_idx) = clicked_element {
+                    self.editing_element = Some(elem_idx);
+                    self.edit_text = self.spatial_elements[elem_idx].content.clone();
+                    self.modified = true;
+                }
+            }
+        }
     }
     
     fn format_xml(&self) -> String {
@@ -467,6 +923,12 @@ impl eframe::App for ChonkerApp {
                     self.show_xml_debug = !self.show_xml_debug;
                 }
                 
+                ui.separator();
+                
+                if ui.button(if self.wysiwyg_mode { "📝 WYSIWYG Mode" } else { "👁️ Display Mode" }).clicked() {
+                    self.wysiwyg_mode = !self.wysiwyg_mode;
+                }
+                
                 if self.show_xml_debug {
                     ui.label("📋 Debug Mode");
                     if ui.button("💾 Save XML").clicked() {
@@ -480,6 +942,12 @@ impl eframe::App for ChonkerApp {
                         if let Err(e) = std::fs::write("chonker9_edited.txt", content) {
                             eprintln!("Error saving text: {}", e);
                         }
+                    }
+                    
+                    // Show edit status
+                    if let Some(elem_idx) = self.editing_element {
+                        ui.label(format!("✏️ Editing element {}: '{}'", elem_idx, 
+                            self.spatial_elements[elem_idx].content.chars().take(20).collect::<String>()));
                     }
                 }
             });
@@ -518,14 +986,68 @@ impl eframe::App for ChonkerApp {
                     .auto_shrink([false, false])  // Allow unlimited scrolling
                     .show(ui, |ui| {
                         if !self.spatial_elements.is_empty() {
-                            // Use hybrid rendering: tables get exact positioning, paragraphs get readability
-                            self.render_hybrid_smart(ui);
+                            if self.wysiwyg_mode {
+                                // Use WYSIWYG mode with readable paragraph rendering + accurate cursor
+                                self.render_wysiwyg_readable(ui);
+                            } else {
+                                // Use readable text display (the one that worked)
+                                self.render_readable_display(ui);
+                            }
                         } else {
                             ui.label("Click '📁 Load PDF' to display content");
                         }
                     });
             }
         });
+        
+        // Show inline editor popup when editing an element (only in display mode)
+        if !self.wysiwyg_mode {
+            if let Some(elem_idx) = self.editing_element {
+            egui::Window::new("✏️ Edit Element")
+                .default_size([400.0, 150.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Editing: '{}'", self.spatial_elements[elem_idx].content));
+                    ui.separator();
+                    
+                    // Text input
+                    let text_edit = ui.add(egui::TextEdit::singleline(&mut self.edit_text)
+                        .desired_width(f32::INFINITY));
+                    
+                    // Auto-focus the text input
+                    if !text_edit.has_focus() {
+                        text_edit.request_focus();
+                    }
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("✅ Save").clicked() {
+                            // Save the edited text back to the element
+                            self.spatial_elements[elem_idx].content = self.edit_text.clone();
+                            self.editing_element = None;
+                            self.edit_text.clear();
+                        }
+                        
+                        if ui.button("❌ Cancel").clicked() {
+                            // Cancel editing
+                            self.editing_element = None;
+                            self.edit_text.clear();
+                        }
+                    });
+                    
+                    // Handle Enter key to save
+                    if text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.spatial_elements[elem_idx].content = self.edit_text.clone();
+                        self.editing_element = None;
+                        self.edit_text.clear();
+                    }
+                    
+                    // Handle Escape to cancel
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.editing_element = None;
+                        self.edit_text.clear();
+                    }
+                });
+            }
+        }
     }
 }
 
