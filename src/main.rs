@@ -755,7 +755,8 @@ impl ChonkerApp {
                 
                 let actual_line_height = 16.0; // Same as cursor rendering
                 let clicked_line = (relative_y / actual_line_height) as usize;
-                let char_in_line = (relative_x / 7.8) as usize;
+                let actual_char_width = 7.4; // Measured from egui monospace actual rendering
+                let char_in_line = (relative_x / actual_char_width) as usize;
                 
                 // Update virtual cursor position (can go anywhere)
                 self.virtual_cursor_pos = (clicked_line, char_in_line);
@@ -795,25 +796,46 @@ impl ChonkerApp {
             }
         }
         
-        // Use ROPE position for both cursor and text insertion (unified system)
+        // Get cursor position using EXACT same method as text rendering
         let rope = &self.spatial_buffer.rope;
         let cursor_pos = self.spatial_cursor.rope_pos.min(rope.len_chars());
         
-        let cursor_line = if rope.len_chars() == 0 { 0 } else { rope.char_to_line(cursor_pos) };
+        if rope.len_chars() == 0 {
+            // No text - cursor at origin
+            let cursor_screen_pos = start_pos;
+            let cursor_rect = egui::Rect::from_min_size(cursor_screen_pos, egui::Vec2::new(8.0, 16.0));
+            painter.rect_filled(cursor_rect, 0.0, egui::Color32::from_rgba_unmultiplied(0, 120, 255, 100));
+            return;
+        }
+        
+        // Find which line and character cursor is on using SAME logic as text renderer
+        let cursor_line = rope.char_to_line(cursor_pos);
         let line_start = rope.line_to_char(cursor_line);
         let cursor_char_in_line = cursor_pos - line_start;
         
-        // Use same line height as egui's actual text rendering
-        let actual_line_height = 16.0; // Match egui's monospace line spacing
-        let cursor_screen_pos = egui::Pos2::new(
-            start_pos.x + (cursor_char_in_line as f32 * 7.8),
-            start_pos.y + (cursor_line as f32 * actual_line_height)
+        // Use MEASURED egui character width (not assumed)
+        let line_y = start_pos.y + (cursor_line as f32 * 16.0);
+        let actual_char_width = 7.4; // Match click detection
+        let char_x = start_pos.x + (cursor_char_in_line as f32 * actual_char_width);
+        let cursor_screen_pos = egui::Pos2::new(char_x, line_y);
+        
+        // Draw cursor as blue character-highlighting rectangle (traditional text editor style)
+        let cursor_rect = egui::Rect::from_min_size(
+            cursor_screen_pos,
+            egui::Vec2::new(actual_char_width, 16.0) // Use measured character width
         );
         
-        // Draw cursor at actual rope position (unified coordinate system)
-        painter.line_segment(
-            [cursor_screen_pos, cursor_screen_pos + egui::Vec2::new(0.0, 16.0)],
-            egui::Stroke::new(3.0, egui::Color32::RED)
+        painter.rect_filled(
+            cursor_rect,
+            0.0, // No rounding
+            egui::Color32::from_rgba_unmultiplied(0, 120, 255, 100) // Blue with transparency
+        );
+        
+        // Optional: Draw border for better visibility
+        painter.rect_stroke(
+            cursor_rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 120, 255)) // Blue border
         );
         
         // Handle text editing
@@ -1015,6 +1037,69 @@ impl ChonkerApp {
                     self.editing_element = Some(elem_idx);
                     self.edit_text = self.spatial_elements[elem_idx].content.clone();
                     self.modified = true;
+                }
+            }
+        }
+    }
+    
+    fn render_pure_spatial_text(&mut self, painter: &egui::Painter, start_pos: egui::Pos2, _text: &str) {
+        // PURE cosmic-text + ropey renderer - NO egui text dependencies
+        
+        let rope = &self.spatial_buffer.rope;
+        if rope.len_chars() == 0 { return; }
+        
+        // Render each ropey line using cosmic-text for precise positioning
+        for rope_line_idx in 0..rope.len_lines() {
+            let line = rope.line(rope_line_idx);
+            let line_text = line.to_string().trim_end_matches('\n').to_string();
+            
+            if !line_text.is_empty() {
+                // Shape this line with cosmic-text
+                let mut line_buffer = Buffer::new(&mut self.font_system, Metrics::new(14.0, 16.0));
+                let kitty_attrs = Attrs::new()
+                    .family(Family::Name("SF Mono"))
+                    .weight(cosmic_text::Weight::NORMAL)
+                    .style(cosmic_text::Style::Normal);
+                    
+                line_buffer.set_text(&mut self.font_system, &line_text, kitty_attrs, Shaping::Advanced);
+                line_buffer.shape_until_scroll(&mut self.font_system, false);
+                
+                let line_y = start_pos.y + (rope_line_idx as f32 * 16.0);
+                
+                // Render glyphs directly using cosmic-text's precise positioning
+                for run in line_buffer.layout_runs() {
+                    for glyph in run.glyphs.iter() {
+                        if let Some(physical_glyph) = &glyph.physical_glyph {
+                            // Rasterize glyph using SwashCache
+                            let mut swash_cache = &mut self.swash_cache;
+                            let image = swash_cache.get_image_uncached(&mut self.font_system, physical_glyph.cache_key);
+                            
+                            if let Some(image) = image {
+                                // Calculate precise pixel position
+                                let glyph_x = start_pos.x + glyph.x - image.placement.left as f32;
+                                let glyph_y = line_y - image.placement.top as f32;
+                                
+                                // Render glyph pixels directly
+                                for (pixel_idx, &alpha) in image.data.iter().enumerate() {
+                                    if alpha > 0 {
+                                        let pixel_x = pixel_idx % image.placement.width as usize;
+                                        let pixel_y = pixel_idx / image.placement.width as usize;
+                                        
+                                        let final_x = glyph_x + pixel_x as f32;
+                                        let final_y = glyph_y + pixel_y as f32;
+                                        
+                                        // Draw pixel with alpha blending
+                                        let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+                                        painter.circle_filled(
+                                            egui::Pos2::new(final_x, final_y),
+                                            0.5, // Half-pixel circles for smooth rendering
+                                            color
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
