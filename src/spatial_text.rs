@@ -3,6 +3,40 @@ use eframe::egui;
 use ropey::Rope;
 use std::collections::HashMap;
 
+/// Coordinate transformation system (altoedit-2.0 getRealPos approach)
+#[derive(Debug, Clone)]
+pub struct CoordinateTransform {
+    pub viewport_rect: egui::Rect,    // Current viewport bounds
+    pub document_rect: egui::Rect,    // Document bounds in document space  
+    pub scale: f32,                   // Current zoom scale
+}
+
+impl CoordinateTransform {
+    pub fn new() -> Self {
+        Self {
+            viewport_rect: egui::Rect::NOTHING,
+            document_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(800.0, 600.0)),
+            scale: 1.0,
+        }
+    }
+    
+    pub fn update_viewport(&mut self, viewport_rect: egui::Rect) {
+        self.viewport_rect = viewport_rect;
+    }
+    
+    pub fn screen_to_document(&self, screen_pos: egui::Pos2) -> egui::Pos2 {
+        // Convert viewport coordinates to document coordinates (altoedit-2.0 getRealPos)
+        let relative_pos = screen_pos - self.viewport_rect.min;
+        egui::pos2(relative_pos.x / self.scale, relative_pos.y / self.scale)
+    }
+    
+    pub fn document_to_screen(&self, doc_pos: egui::Pos2) -> egui::Pos2 {
+        // Convert document coordinates to viewport coordinates  
+        let scaled_pos = egui::pos2(doc_pos.x * self.scale, doc_pos.y * self.scale);
+        scaled_pos + self.viewport_rect.min.to_vec2()
+    }
+}
+
 /// Maps a range in the unified text buffer to spatial positioning
 #[derive(Debug, Clone)]
 pub struct ElementRange {
@@ -15,41 +49,95 @@ pub struct ElementRange {
     pub modified: bool,           // Has been edited from original
 }
 
-/// Fast spatial lookup index for coordinate queries
+/// Grid-based spatial indexing (like altoedit-2.0)
 #[derive(Debug)]
 pub struct SpatialIndex {
-    element_bounds: Vec<(egui::Rect, usize)>, // (bounds, element_range_index)
+    grid: Vec<Vec<Vec<usize>>>,              // grid[y][x] = [element_indices]
+    grid_size: f32,                          // Size of each grid cell
+    doc_bounds: egui::Rect,                  // Document bounds for grid calculation
     dirty_regions: Vec<egui::Rect>,          // Regions needing re-render
 }
 
 impl SpatialIndex {
     pub fn new() -> Self {
         Self {
-            element_bounds: Vec::new(),
+            grid: Vec::new(),
+            grid_size: 50.0, // 50px grid cells (like altoedit-2.0)
+            doc_bounds: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1000.0, 1000.0)),
             dirty_regions: Vec::new(),
         }
     }
     
     pub fn rebuild(&mut self, element_ranges: &[ElementRange]) {
-        self.element_bounds.clear();
-        for (i, range) in element_ranges.iter().enumerate() {
-            self.element_bounds.push((range.visual_bounds, i));
+        // Build grid-based spatial index (altoedit-2.0 approach)
+        
+        // Calculate document bounds
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        
+        for range in element_ranges {
+            let bounds = &range.visual_bounds;
+            min_x = min_x.min(bounds.min.x);
+            min_y = min_y.min(bounds.min.y);
+            max_x = max_x.max(bounds.max.x);
+            max_y = max_y.max(bounds.max.y);
         }
-        // TODO: Sort by spatial position for faster queries
-        self.element_bounds.sort_by(|a, b| {
-            a.0.min.y.partial_cmp(&b.0.min.y)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.min.x.partial_cmp(&b.0.min.x).unwrap_or(std::cmp::Ordering::Equal))
-        });
+        
+        self.doc_bounds = egui::Rect::from_min_max(
+            egui::pos2(min_x, min_y),
+            egui::pos2(max_x, max_y)
+        );
+        
+        // Initialize grid
+        let grid_cols = ((self.doc_bounds.width() / self.grid_size).ceil() as usize).max(1);
+        let grid_rows = ((self.doc_bounds.height() / self.grid_size).ceil() as usize).max(1);
+        
+        self.grid = vec![vec![Vec::new(); grid_cols]; grid_rows];
+        
+        // Populate grid with element indices
+        for (i, range) in element_ranges.iter().enumerate() {
+            let bounds = &range.visual_bounds;
+            
+            // Find which grid cells this element overlaps
+            let start_col = ((bounds.min.x - self.doc_bounds.min.x) / self.grid_size) as usize;
+            let end_col = ((bounds.max.x - self.doc_bounds.min.x) / self.grid_size) as usize;
+            let start_row = ((bounds.min.y - self.doc_bounds.min.y) / self.grid_size) as usize;
+            let end_row = ((bounds.max.y - self.doc_bounds.min.y) / self.grid_size) as usize;
+            
+            // Add element to all overlapping grid cells
+            for row in start_row..=end_row.min(grid_rows.saturating_sub(1)) {
+                for col in start_col..=end_col.min(grid_cols.saturating_sub(1)) {
+                    self.grid[row][col].push(i);
+                }
+            }
+        }
     }
     
     pub fn find_element_at_position(&self, pos: egui::Pos2) -> Option<usize> {
-        // Linear search for now - can optimize with R-tree later
-        for (bounds, element_idx) in &self.element_bounds {
-            if bounds.contains(pos) {
-                return Some(*element_idx);
-            }
+        // Fast grid-based lookup (altoedit-2.0 technique)
+        
+        // Check if position is within document bounds
+        if !self.doc_bounds.contains(pos) {
+            return None;
         }
+        
+        // Calculate grid cell
+        let col = ((pos.x - self.doc_bounds.min.x) / self.grid_size) as usize;
+        let row = ((pos.y - self.doc_bounds.min.y) / self.grid_size) as usize;
+        
+        // Check grid bounds
+        if row >= self.grid.len() || col >= self.grid[row].len() {
+            return None;
+        }
+        
+        // Search only elements in this grid cell (much faster than linear search)
+        for &element_idx in &self.grid[row][col] {
+            // Return first match (could be enhanced with distance calculation)
+            return Some(element_idx);
+        }
+        
         None
     }
     
@@ -72,6 +160,8 @@ pub struct SpatialTextBuffer {
     pub selection: Option<(usize, usize)>,   // Selection range in rope
     pub zoom: f32,                           // Current zoom level
     pub pan: egui::Vec2,                     // Current pan offset
+    // Coordinate transformation system (altoedit-2.0 style)
+    pub viewport_to_document_transform: CoordinateTransform,
 }
 
 impl SpatialTextBuffer {
@@ -84,6 +174,7 @@ impl SpatialTextBuffer {
             selection: None,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
+            viewport_to_document_transform: CoordinateTransform::new(),
         }
     }
     

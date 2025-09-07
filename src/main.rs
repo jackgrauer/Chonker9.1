@@ -1,5 +1,7 @@
 use eframe::egui;
 use std::{process::Command, sync::{Arc, Mutex}, thread, time::Duration};
+use cosmic_text::{FontSystem, Buffer, Metrics, Attrs, Shaping, Family, SwashCache};
+use rfd::FileDialog;
 
 mod spatial_text;
 use spatial_text::{SpatialTextBuffer, SpatialCursor, ElementRange};
@@ -54,6 +56,10 @@ struct ChonkerApp {
     // WYSIWYG spatial editing system
     spatial_buffer: SpatialTextBuffer,
     spatial_cursor: SpatialCursor,
+    // Cosmic-text for professional typography  
+    font_system: FontSystem,
+    text_buffer: Buffer,
+    swash_cache: SwashCache,
     wysiwyg_mode: bool,              // Toggle between old and new system
 }
 
@@ -76,6 +82,22 @@ impl Default for ChonkerApp {
             edit_text: String::new(),
             spatial_buffer: SpatialTextBuffer::new(),
             spatial_cursor: SpatialCursor::new(),
+            // Initialize cosmic-text for Kitty-quality typography
+            font_system: FontSystem::new(),
+            text_buffer: {
+                let mut fs = FontSystem::new();
+                let mut buffer = Buffer::new(&mut fs, Metrics::new(14.0, 18.0));
+                
+                // Set Kitty-like font attributes for superior rendering
+                let kitty_attrs = Attrs::new()
+                    .family(Family::Name("SF Mono"))  // Kitty's preferred font on macOS
+                    .weight(cosmic_text::Weight::NORMAL)
+                    .style(cosmic_text::Style::Normal);
+                
+                buffer.set_text(&mut fs, "Initial text", kitty_attrs, Shaping::Advanced);
+                buffer
+            },
+            swash_cache: SwashCache::new(),
             wysiwyg_mode: false,
         }
     }
@@ -648,6 +670,7 @@ impl ChonkerApp {
                                     self.spatial_buffer.delete_range(self.spatial_cursor.rope_pos - 1, self.spatial_cursor.rope_pos);
                                     self.spatial_cursor.rope_pos -= 1;
                                     self.modified = true;
+                                    // XML updates automatically
                                 }
                             }
                             egui::Key::ArrowLeft => {
@@ -670,12 +693,11 @@ impl ChonkerApp {
     }
     
     fn render_wysiwyg_readable(&mut self, ui: &mut egui::Ui) {
-        // Combine readable paragraph rendering with WYSIWYG cursor positioning
-        let canvas_width = 3000.0;
-        let canvas_height = 2000.0;
+        // Use ENTIRE right quadrant - allocate ALL available space
+        let full_size = ui.available_size();
         
         let (response, painter) = ui.allocate_painter(
-            egui::Vec2::new(canvas_width, canvas_height), 
+            full_size, // Use complete available area
             egui::Sense::click_and_drag()
         );
         
@@ -701,28 +723,128 @@ impl ChonkerApp {
             }
         }
         
-        // Render table elements (green)
-        for element in table_elements {
-            let pos = egui::Pos2::new(element.hpos * scale_x, element.vpos * scale_y);
-            painter.text(pos, egui::Align2::LEFT_TOP, &element.content, 
-                        egui::FontId::monospace(12.0), egui::Color32::from_rgb(150, 255, 150));
-        }
+        // Green text REMOVED for clean editing
+        // for element in table_elements {
+        //     let pos = egui::Pos2::new(element.hpos * scale_x, element.vpos * scale_y);
+        //     painter.text(pos, egui::Align2::LEFT_TOP, &element.content, 
+        //                 egui::FontId::monospace(12.0), egui::Color32::from_rgb(150, 255, 150));
+        // }
         
-        // Render live editable text in readable format (not individual elements)
-        self.render_live_readable_paragraphs(&painter, scale_x, scale_y);
+        // Update coordinate transform with current viewport (altoedit-2.0 approach)
+        let viewport_rect = response.rect;
+        self.spatial_buffer.viewport_to_document_transform.update_viewport(viewport_rect);
         
-        // WYSIWYG cursor and editing
+        // Position text at document origin, transformed to viewport coordinates  
+        let document_origin = egui::Pos2::new(20.0, 20.0); // Document space coordinates
+        let start_pos = self.spatial_buffer.viewport_to_document_transform.document_to_screen(document_origin);
+        
+        // Render live editable text positioned relative to viewport
+        self.render_live_readable_paragraphs(&painter, scale_x, scale_y, start_pos);
+        
+        // altoedit-2.0 style cursor positioning using grid lookup and coordinate transform
         if response.clicked() {
             if let Some(click_pos) = response.interact_pointer_pos() {
-                if let Some(rope_pos) = self.spatial_buffer.screen_to_rope_position(click_pos) {
-                    self.spatial_cursor.rope_pos = rope_pos;
+                // Convert screen click to document coordinates (like their getRealPos)
+                let doc_pos = self.spatial_buffer.viewport_to_document_transform.screen_to_document(click_pos);
+                
+                // Use grid-based lookup for precise element detection
+                if let Some(_element_idx) = self.spatial_buffer.spatial_index.find_element_at_position(doc_pos) {
+                    // Found specific element - position cursor within it
+                    // For now, use line-based positioning but with viewport-relative coordinates
+                    let relative_x = (click_pos.x - start_pos.x).max(0.0);
+                    let relative_y = (click_pos.y - start_pos.y).max(0.0);
+                    
+                    let live_text = self.spatial_buffer.rope.to_string();
+                    let lines: Vec<&str> = live_text.lines().collect();
+                    
+                    let clicked_line = (relative_y / 18.0) as usize;
+                    
+                    if clicked_line < lines.len() {
+                        let line_text = lines[clicked_line];
+                        let char_in_line = (relative_x / 7.8) as usize;
+                        let char_position = char_in_line.min(line_text.len());
+                        
+                        // Calculate rope position
+                        let mut rope_pos = 0;
+                        for i in 0..clicked_line {
+                            rope_pos += lines[i].len() + 1;
+                        }
+                        rope_pos += char_position;
+                        
+                        self.spatial_cursor.rope_pos = rope_pos.min(self.spatial_buffer.rope.len_chars());
+                    } else {
+                        self.spatial_cursor.rope_pos = self.spatial_buffer.rope.len_chars();
+                    }
+                } else {
+                    // No element in grid - still try to position cursor based on click
+                    let relative_x = (click_pos.x - start_pos.x).max(0.0);
+                    let relative_y = (click_pos.y - start_pos.y).max(0.0);
+                    
+                    let live_text = self.spatial_buffer.rope.to_string();
+                    let lines: Vec<&str> = live_text.lines().collect();
+                    let clicked_line = (relative_y / 18.0) as usize;
+                    
+                    if clicked_line < lines.len() {
+                        let line_text = lines[clicked_line];
+                        let char_in_line = (relative_x / 7.8) as usize;
+                        let char_position = char_in_line.min(line_text.len());
+                        
+                        let mut rope_pos = 0;
+                        for i in 0..clicked_line {
+                            rope_pos += lines[i].len() + 1;
+                        }
+                        rope_pos += char_position;
+                        
+                        self.spatial_cursor.rope_pos = rope_pos.min(self.spatial_buffer.rope.len_chars());
+                    } else {
+                        self.spatial_cursor.rope_pos = self.spatial_buffer.rope.len_chars();
+                    }
                 }
+                
+                // Start selection
+                self.selection_start = Some(self.spatial_cursor.rope_pos);
+                self.selection_end = None;
             }
         }
         
-        // Update and render cursor
-        self.spatial_cursor.update_position(&self.spatial_buffer);
-        self.spatial_cursor.render(&painter);
+        // Handle drag selection
+        if response.dragged() {
+            if let Some(drag_pos) = response.interact_pointer_pos() {
+                let text_start = start_pos;
+                let relative_x = (drag_pos.x - text_start.x).max(0.0);
+                let relative_y = (drag_pos.y - text_start.y).max(0.0);
+                
+                let line = (relative_y / 18.0) as usize;
+                let column = (relative_x / 7.8) as usize;
+                let rope_pos = (line * 80) + column;
+                
+                self.selection_end = Some(rope_pos.min(self.spatial_buffer.rope.len_chars()));
+            }
+        }
+        
+        // ALWAYS render cursor - simplified and robust
+        let live_text = self.spatial_buffer.rope.to_string();
+        let lines: Vec<&str> = live_text.lines().collect();
+        
+        // Get cursor position with bounds checking
+        let (cursor_line, cursor_char_in_line) = if lines.is_empty() {
+            (0, 0) // Default if no text
+        } else {
+            let (line, char) = self.get_cursor_line_char(&lines);
+            (line.min(lines.len().saturating_sub(1)), char) // Clamp to valid range
+        };
+        
+        // Always render cursor at calculated position
+        let cursor_screen_pos = egui::Pos2::new(
+            start_pos.x + (cursor_char_in_line as f32 * 7.8),
+            start_pos.y + (cursor_line as f32 * 18.0)
+        );
+        
+        // ALWAYS draw red cursor (no conditions)
+        painter.line_segment(
+            [cursor_screen_pos, cursor_screen_pos + egui::Vec2::new(0.0, 16.0)],
+            egui::Stroke::new(3.0, egui::Color32::RED) // Thicker for better visibility
+        );
         
         // Handle text editing
         ui.input(|i| {
@@ -732,6 +854,8 @@ impl ChonkerApp {
                         self.spatial_buffer.insert_text(self.spatial_cursor.rope_pos, text);
                         self.spatial_cursor.rope_pos += text.chars().count();
                         self.modified = true;
+                        
+                        // XML will update automatically on next frame
                     }
                     egui::Event::Key { key, pressed: true, .. } => {
                         match key {
@@ -740,6 +864,7 @@ impl ChonkerApp {
                                     self.spatial_buffer.delete_range(self.spatial_cursor.rope_pos - 1, self.spatial_cursor.rope_pos);
                                     self.spatial_cursor.rope_pos -= 1;
                                     self.modified = true;
+                                    // XML updates automatically
                                 }
                             }
                             egui::Key::ArrowLeft => {
@@ -750,6 +875,53 @@ impl ChonkerApp {
                                     self.spatial_cursor.rope_pos += 1; 
                                 }
                             }
+                            egui::Key::ArrowUp => {
+                                // Claude Code style up/down navigation (respects actual line lengths)
+                                let live_text = self.spatial_buffer.rope.to_string();
+                                let lines: Vec<&str> = live_text.lines().collect();
+                                
+                                let (current_line, char_in_line) = self.get_cursor_line_char(&lines);
+                                if current_line > 0 {
+                                    let target_line = current_line - 1;
+                                    let target_char = char_in_line.min(lines[target_line].len());
+                                    self.spatial_cursor.rope_pos = self.line_char_to_rope_pos(&lines, target_line, target_char);
+                                }
+                            }
+                            egui::Key::ArrowDown => {
+                                // Claude Code style down navigation
+                                let live_text = self.spatial_buffer.rope.to_string();
+                                let lines: Vec<&str> = live_text.lines().collect();
+                                
+                                let (current_line, char_in_line) = self.get_cursor_line_char(&lines);
+                                if current_line < lines.len().saturating_sub(1) {
+                                    let target_line = current_line + 1;
+                                    let target_char = char_in_line.min(lines[target_line].len());
+                                    self.spatial_cursor.rope_pos = self.line_char_to_rope_pos(&lines, target_line, target_char);
+                                }
+                            }
+                            egui::Key::Enter => {
+                                // Add real line break for multi-line editing
+                                self.spatial_buffer.insert_text(self.spatial_cursor.rope_pos, "\n");
+                                self.spatial_cursor.rope_pos += 1;
+                                self.modified = true;
+                            }
+                            egui::Key::C if i.modifiers.ctrl => {
+                                // Copy selected text
+                                if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
+                                    let min_pos = start.min(end);
+                                    let max_pos = start.max(end);
+                                    let selected_text = self.spatial_buffer.rope.slice(min_pos..max_pos).to_string();
+                                    // TODO: Actually copy to system clipboard
+                                }
+                            }
+                            egui::Key::V if i.modifiers.ctrl => {
+                                // Paste from clipboard (placeholder)
+                                // TODO: Get text from system clipboard and insert
+                                let paste_text = "PASTED TEXT"; // Placeholder
+                                self.spatial_buffer.insert_text(self.spatial_cursor.rope_pos, paste_text);
+                                self.spatial_cursor.rope_pos += paste_text.len();
+                                self.modified = true;
+                            }
                             _ => {}
                         }
                     }
@@ -759,40 +931,47 @@ impl ChonkerApp {
         });
     }
     
-    fn render_live_readable_paragraphs(&self, painter: &egui::Painter, scale_x: f32, scale_y: f32) {
-        // Show the live edited rope content in readable format (white text that responds to edits)
+    fn render_live_readable_paragraphs(&mut self, painter: &egui::Painter, _scale_x: f32, _scale_y: f32, viewport_start: egui::Pos2) {
+        // Show live edited rope content positioned relative to viewport
         let live_text = self.spatial_buffer.rope.to_string();
+        let start_pos = viewport_start; // Use actual viewport position
         
-        // Find the starting position (use first non-table element)
-        let mut start_pos = egui::Pos2::new(100.0, 100.0); // Default position
-        for element in &self.spatial_elements {
-            let content = element.content.trim();
-            let is_in_table_region = element.vpos >= 409.0 && element.vpos <= 517.0;
-            let is_table_content = content.contains('$') ||
-                                  content == "N/A" ||
-                                  content.contains('%') ||
-                                  (content.chars().all(|c| c.is_numeric()) && content.len() == 4);
-            
-            if !(is_in_table_region && is_table_content) {
-                start_pos = egui::Pos2::new(element.hpos * scale_x, element.vpos * scale_y);
-                break;
-            }
-        }
+        // Proper text formatting with natural line breaks
+        let formatted_text = if live_text.contains('\n') {
+            live_text // Use actual line breaks from rope
+        } else {
+            // Add line breaks every 80 chars only if no natural breaks exist
+            live_text
+                .chars()
+                .collect::<Vec<char>>()
+                .chunks(80)
+                .map(|chunk| chunk.iter().collect::<String>())
+                .collect::<Vec<String>>()
+                .join("\n")
+        };
         
-        // Format live text with line breaks for readability
-        let formatted_text = live_text
-            .chars()
-            .collect::<Vec<char>>()
-            .chunks(80) // Break into 80-character lines
-            .map(|chunk| chunk.iter().collect::<String>())
-            .collect::<Vec<String>>()
-            .join("\n");
+        // Update cosmic-text buffer with current content and Kitty-quality rendering
+        let kitty_attrs = Attrs::new()
+            .family(Family::Name("SF Mono"))
+            .weight(cosmic_text::Weight::NORMAL)
+            .style(cosmic_text::Style::Normal);
         
+        // Set the live text in cosmic-text buffer for superior kerning
+        self.text_buffer.set_text(&mut self.font_system, &formatted_text, kitty_attrs, Shaping::Advanced);
+        
+        // Shape the text for proper kerning and glyph positioning
+        self.text_buffer.shape_until_scroll(&mut self.font_system, false);
+        
+        // Render using cosmic-text's superior layout (simplified approach)
+        // For now, use cosmic-text for measurement but egui for rendering
+        // TODO: Full cosmic-text rendering requires more complex glyph handling
+        
+        // Render text with SF Mono font (Kitty-style)  
         painter.text(
             start_pos,
             egui::Align2::LEFT_TOP,
             &formatted_text,
-            egui::FontId::monospace(12.0),
+            egui::FontId::monospace(14.0), // SF Mono-like metrics
             egui::Color32::WHITE
         );
     }
@@ -873,6 +1052,76 @@ impl ChonkerApp {
         }
     }
     
+    fn get_cursor_line_char(&self, lines: &[&str]) -> (usize, usize) {
+        // Calculate which line and character position cursor is on (like Claude Code)
+        let mut char_count = 0;
+        for (line_idx, line) in lines.iter().enumerate() {
+            if self.spatial_cursor.rope_pos <= char_count + line.len() {
+                return (line_idx, self.spatial_cursor.rope_pos - char_count);
+            }
+            char_count += line.len() + 1; // +1 for newline
+        }
+        (lines.len().saturating_sub(1), 0) // Default to last line, start
+    }
+    
+    fn line_char_to_rope_pos(&self, lines: &[&str], target_line: usize, target_char: usize) -> usize {
+        // Convert line/character position back to rope position
+        let mut rope_pos = 0;
+        for i in 0..target_line.min(lines.len()) {
+            rope_pos += lines[i].len() + 1; // +1 for newline
+        }
+        rope_pos + target_char
+    }
+    
+    fn generate_live_alto_xml(&self) -> String {
+        // Generate real-time ALTO XML showing current editor state
+        let live_text = self.spatial_buffer.rope.to_string();
+        let lines: Vec<&str> = live_text.lines().collect();
+        let total_lines = lines.len().max(1);
+        let block_height = total_lines * 18;
+        
+        let mut xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<alto xmlns="http://www.loc.gov/standards/alto/ns-v3#">
+<Description>
+  <MeasurementUnit>pixel</MeasurementUnit>
+  <OCRProcessing>
+    <processingSoftware>
+      <softwareName>Chonker9-WYSIWYG</softwareName>
+      <softwareVersion>Live Editor - {} chars, {} lines, cursor at {}</softwareVersion>
+    </processingSoftware>
+  </OCRProcessing>
+</Description>
+<Styles>
+  <TextStyle ID="font0" FONTFAMILY="monospace" FONTSIZE="13.0" FONTCOLOR="FFFFFF"/>
+</Styles>
+<Layout>
+  <Page ID="LivePage" WIDTH="800" HEIGHT="600">
+    <PrintSpace>
+      <TextBlock ID="live_block" HPOS="20.0" VPOS="20.0" WIDTH="640" HEIGHT="{}">
+"#, live_text.chars().count(), total_lines, self.spatial_cursor.rope_pos, block_height);
+        
+        // Add each line as a separate TextLine with proper coordinates
+        for (line_idx, line) in lines.iter().enumerate() {
+            let line_y = 20.0 + (line_idx as f32 * 18.0);
+            let line_width = line.len() * 8;
+            
+            xml.push_str(&format!(
+                r#"        <TextLine ID="live_line_{}" HPOS="20.0" VPOS="{:.1}" WIDTH="{}" HEIGHT="18">
+          <String ID="live_string_{}" CONTENT="{}" HPOS="20.0" VPOS="{:.1}" 
+                  WIDTH="{}" HEIGHT="16" STYLEREFS="font0"/>
+        </TextLine>
+"#, line_idx + 1, line_y, line_width, line_idx + 1, line.replace("\"", "&quot;"), line_y, line_width));
+        }
+        
+        xml.push_str(r#"      </TextBlock>
+    </PrintSpace>
+  </Page>
+</Layout>
+</alto>"#);
+        
+        xml
+    }
+    
     fn format_xml(&self) -> String {
         // Simple XML formatting for better readability
         let mut formatted = String::new();
@@ -950,8 +1199,17 @@ impl eframe::App for ChonkerApp {
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("📁 Load PDF").clicked() {
-                    if let Err(e) = self.load_pdf() {
-                        eprintln!("Error loading PDF: {}", e);
+                    // Native file dialog for PDF selection
+                    if let Some(path) = FileDialog::new()
+                        .add_filter("PDF Files", &["pdf"])
+                        .add_filter("All Files", &["*"])
+                        .set_directory("~/Documents")
+                        .pick_file() {
+                        
+                        self.pdf_path = path.to_string_lossy().to_string();
+                        if let Err(e) = self.load_pdf() {
+                            eprintln!("Error loading PDF: {}", e);
+                        }
                     }
                 }
                 
@@ -960,6 +1218,8 @@ impl eframe::App for ChonkerApp {
                 if ui.button("🔍 XML Debug").clicked() {
                     self.show_xml_debug = !self.show_xml_debug;
                 }
+                
+                // Removed pointless button - live XML shows automatically in split view
                 
                 
                 if self.show_xml_debug {
@@ -980,45 +1240,40 @@ impl eframe::App for ChonkerApp {
             });
         });
         
-        // Main content area
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.show_xml_debug {
-                // XML Debug View - Formatted and Readable
-                ui.heading("🔍 Raw ALTO XML Structure");
+        // Force true 50/50 split - left panel takes exactly half
+        let screen_width = ctx.screen_rect().width();
+        egui::SidePanel::left("xml_panel")
+            .exact_width(screen_width / 2.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.heading("🔍 Live ALTO XML (Updates in Real-Time)");
                 
-                // Format XML for better readability
-                let formatted_xml = self.format_xml();
+                // Always show live XML (since we have split view)
+                ui.label("Auto-updates as you edit →");
                 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add(egui::TextEdit::multiline(&mut formatted_xml.as_str())
-                        .font(egui::TextStyle::Monospace)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(40));
-                });
-            } else {
-                // PDF View with Absolute Coordinates
-                ui.horizontal(|ui| {
-                    ui.heading("📄 PDF Content (Absolute Positioning)");
-                    ui.separator();
-                    if ui.button("📝 Readable Text").clicked() {
-                        // Toggle between absolute and readable view
-                    }
-                    if self.modified {
-                        ui.label("*MODIFIED*");
-                    }
-                });
+                let xml_display = self.generate_live_alto_xml();
                 
                 egui::ScrollArea::both()
-                    .auto_shrink([false, false])  // Allow unlimited scrolling
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if !self.spatial_elements.is_empty() {
-                            // Always use WYSIWYG spatial editing mode
-                            self.render_wysiwyg_readable(ui);
-                        } else {
-                            ui.label("Click '📁 Load PDF' to display content");
-                        }
+                        ui.add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut xml_display.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .code_editor()
+                        );
                     });
+            });
+
+        // Right panel: WYSIWYG Editor using full quadrant
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("📝 WYSIWYG Editor (Edit and Watch XML Update)");
+            
+            // Use entire remaining space for editor
+            if !self.spatial_elements.is_empty() {
+                self.render_wysiwyg_readable(ui);
+            } else {
+                ui.label("Loading content...");
             }
         });
         
