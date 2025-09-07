@@ -1,6 +1,6 @@
 use eframe::egui;
 use std::{process::Command, sync::{Arc, Mutex}, thread, time::Duration};
-use cosmic_text::{FontSystem, Buffer, Metrics, Attrs, Shaping, Family, SwashCache};
+use cosmic_text::{FontSystem, Buffer, Metrics, Attrs, Shaping, Family, SwashCache, Color as CosmicColor};
 use rfd::FileDialog;
 
 mod spatial_text;
@@ -56,6 +56,7 @@ struct ChonkerApp {
     // WYSIWYG spatial editing system
     spatial_buffer: SpatialTextBuffer,
     spatial_cursor: SpatialCursor,
+    virtual_cursor_pos: (usize, usize), // (line, column) - can go beyond text
     // Cosmic-text for professional typography  
     font_system: FontSystem,
     text_buffer: Buffer,
@@ -82,11 +83,12 @@ impl Default for ChonkerApp {
             edit_text: String::new(),
             spatial_buffer: SpatialTextBuffer::new(),
             spatial_cursor: SpatialCursor::new(),
+            virtual_cursor_pos: (0, 0), // Start at line 0, column 0
             // Initialize cosmic-text for Kitty-quality typography
             font_system: FontSystem::new(),
             text_buffer: {
                 let mut fs = FontSystem::new();
-                let mut buffer = Buffer::new(&mut fs, Metrics::new(14.0, 18.0));
+                let mut buffer = Buffer::new(&mut fs, Metrics::new(14.0, 16.0)); // Match actual line height
                 
                 // Set Kitty-like font attributes for superior rendering
                 let kitty_attrs = Attrs::new()
@@ -747,58 +749,29 @@ impl ChonkerApp {
                 // Convert screen click to document coordinates (like their getRealPos)
                 let doc_pos = self.spatial_buffer.viewport_to_document_transform.screen_to_document(click_pos);
                 
-                // Use grid-based lookup for precise element detection
-                if let Some(_element_idx) = self.spatial_buffer.spatial_index.find_element_at_position(doc_pos) {
-                    // Found specific element - position cursor within it
-                    // For now, use line-based positioning but with viewport-relative coordinates
-                    let relative_x = (click_pos.x - start_pos.x).max(0.0);
-                    let relative_y = (click_pos.y - start_pos.y).max(0.0);
-                    
-                    let live_text = self.spatial_buffer.rope.to_string();
-                    let lines: Vec<&str> = live_text.lines().collect();
-                    
-                    let clicked_line = (relative_y / 18.0) as usize;
-                    
-                    if clicked_line < lines.len() {
-                        let line_text = lines[clicked_line];
-                        let char_in_line = (relative_x / 7.8) as usize;
-                        let char_position = char_in_line.min(line_text.len());
-                        
-                        // Calculate rope position
-                        let mut rope_pos = 0;
-                        for i in 0..clicked_line {
-                            rope_pos += lines[i].len() + 1;
-                        }
-                        rope_pos += char_position;
-                        
-                        self.spatial_cursor.rope_pos = rope_pos.min(self.spatial_buffer.rope.len_chars());
-                    } else {
-                        self.spatial_cursor.rope_pos = self.spatial_buffer.rope.len_chars();
-                    }
+                // Virtual cursor can go ANYWHERE - not limited by text boundaries
+                let relative_x = (click_pos.x - start_pos.x).max(0.0);
+                let relative_y = (click_pos.y - start_pos.y).max(0.0);
+                
+                let actual_line_height = 16.0; // Same as cursor rendering
+                let clicked_line = (relative_y / actual_line_height) as usize;
+                let char_in_line = (relative_x / 7.8) as usize;
+                
+                // Update virtual cursor position (can go anywhere)
+                self.virtual_cursor_pos = (clicked_line, char_in_line);
+                
+                // Update rope cursor to closest valid position
+                let rope = &self.spatial_buffer.rope;
+                if rope.len_chars() == 0 {
+                    self.spatial_cursor.rope_pos = 0;
+                } else if clicked_line < rope.len_lines() {
+                    let line_start = rope.line_to_char(clicked_line);
+                    let line = rope.line(clicked_line);
+                    let line_len = line.len_chars().saturating_sub(1);
+                    let char_position = char_in_line.min(line_len);
+                    self.spatial_cursor.rope_pos = line_start + char_position;
                 } else {
-                    // No element in grid - still try to position cursor based on click
-                    let relative_x = (click_pos.x - start_pos.x).max(0.0);
-                    let relative_y = (click_pos.y - start_pos.y).max(0.0);
-                    
-                    let live_text = self.spatial_buffer.rope.to_string();
-                    let lines: Vec<&str> = live_text.lines().collect();
-                    let clicked_line = (relative_y / 18.0) as usize;
-                    
-                    if clicked_line < lines.len() {
-                        let line_text = lines[clicked_line];
-                        let char_in_line = (relative_x / 7.8) as usize;
-                        let char_position = char_in_line.min(line_text.len());
-                        
-                        let mut rope_pos = 0;
-                        for i in 0..clicked_line {
-                            rope_pos += lines[i].len() + 1;
-                        }
-                        rope_pos += char_position;
-                        
-                        self.spatial_cursor.rope_pos = rope_pos.min(self.spatial_buffer.rope.len_chars());
-                    } else {
-                        self.spatial_cursor.rope_pos = self.spatial_buffer.rope.len_chars();
-                    }
+                    self.spatial_cursor.rope_pos = rope.len_chars();
                 }
                 
                 // Start selection
@@ -822,28 +795,25 @@ impl ChonkerApp {
             }
         }
         
-        // ALWAYS render cursor - simplified and robust
-        let live_text = self.spatial_buffer.rope.to_string();
-        let lines: Vec<&str> = live_text.lines().collect();
+        // Use ROPE position for both cursor and text insertion (unified system)
+        let rope = &self.spatial_buffer.rope;
+        let cursor_pos = self.spatial_cursor.rope_pos.min(rope.len_chars());
         
-        // Get cursor position with bounds checking
-        let (cursor_line, cursor_char_in_line) = if lines.is_empty() {
-            (0, 0) // Default if no text
-        } else {
-            let (line, char) = self.get_cursor_line_char(&lines);
-            (line.min(lines.len().saturating_sub(1)), char) // Clamp to valid range
-        };
+        let cursor_line = if rope.len_chars() == 0 { 0 } else { rope.char_to_line(cursor_pos) };
+        let line_start = rope.line_to_char(cursor_line);
+        let cursor_char_in_line = cursor_pos - line_start;
         
-        // Always render cursor at calculated position
+        // Use same line height as egui's actual text rendering
+        let actual_line_height = 16.0; // Match egui's monospace line spacing
         let cursor_screen_pos = egui::Pos2::new(
             start_pos.x + (cursor_char_in_line as f32 * 7.8),
-            start_pos.y + (cursor_line as f32 * 18.0)
+            start_pos.y + (cursor_line as f32 * actual_line_height)
         );
         
-        // ALWAYS draw red cursor (no conditions)
+        // Draw cursor at actual rope position (unified coordinate system)
         painter.line_segment(
             [cursor_screen_pos, cursor_screen_pos + egui::Vec2::new(0.0, 16.0)],
-            egui::Stroke::new(3.0, egui::Color32::RED) // Thicker for better visibility
+            egui::Stroke::new(3.0, egui::Color32::RED)
         );
         
         // Handle text editing
@@ -851,11 +821,10 @@ impl ChonkerApp {
             for event in &i.events {
                 match event {
                     egui::Event::Text(text) => {
+                        // Insert text at rope position (where cursor actually is)
                         self.spatial_buffer.insert_text(self.spatial_cursor.rope_pos, text);
                         self.spatial_cursor.rope_pos += text.chars().count();
                         self.modified = true;
-                        
-                        // XML will update automatically on next frame
                     }
                     egui::Event::Key { key, pressed: true, .. } => {
                         match key {
@@ -868,35 +837,55 @@ impl ChonkerApp {
                                 }
                             }
                             egui::Key::ArrowLeft => {
-                                if self.spatial_cursor.rope_pos > 0 { self.spatial_cursor.rope_pos -= 1; }
+                                // PROPER ropey left navigation  
+                                let rope = &self.spatial_buffer.rope;
+                                if self.spatial_cursor.rope_pos > 0 {
+                                    self.spatial_cursor.rope_pos -= 1;
+                                }
                             }
                             egui::Key::ArrowRight => {
-                                if self.spatial_cursor.rope_pos < self.spatial_buffer.rope.len_chars() { 
-                                    self.spatial_cursor.rope_pos += 1; 
+                                // PROPER ropey right navigation - can go to end of line
+                                let rope = &self.spatial_buffer.rope;
+                                if self.spatial_cursor.rope_pos < rope.len_chars() {
+                                    self.spatial_cursor.rope_pos += 1;
                                 }
                             }
                             egui::Key::ArrowUp => {
-                                // Claude Code style up/down navigation (respects actual line lengths)
-                                let live_text = self.spatial_buffer.rope.to_string();
-                                let lines: Vec<&str> = live_text.lines().collect();
+                                // PROPER ropey navigation - handles empty lines
+                                let rope = &self.spatial_buffer.rope;
+                                let cursor_pos = self.spatial_cursor.rope_pos.min(rope.len_chars());
+                                let current_line = rope.char_to_line(cursor_pos);
                                 
-                                let (current_line, char_in_line) = self.get_cursor_line_char(&lines);
                                 if current_line > 0 {
+                                    let current_char_in_line = cursor_pos - rope.line_to_char(current_line);
                                     let target_line = current_line - 1;
-                                    let target_char = char_in_line.min(lines[target_line].len());
-                                    self.spatial_cursor.rope_pos = self.line_char_to_rope_pos(&lines, target_line, target_char);
+                                    let target_line_start = rope.line_to_char(target_line);
+                                    let target_line_len = rope.line(target_line).len_chars().saturating_sub(1);
+                                    
+                                    // Position at same character or end of line if shorter (handles empty lines)
+                                    let target_char = current_char_in_line.min(target_line_len);
+                                    self.spatial_cursor.rope_pos = target_line_start + target_char;
                                 }
                             }
                             egui::Key::ArrowDown => {
-                                // Claude Code style down navigation
-                                let live_text = self.spatial_buffer.rope.to_string();
-                                let lines: Vec<&str> = live_text.lines().collect();
+                                // Direct ropey navigation - move down one line
+                                let rope = &self.spatial_buffer.rope;
+                                if rope.len_chars() == 0 { return; } // No text to navigate
                                 
-                                let (current_line, char_in_line) = self.get_cursor_line_char(&lines);
-                                if current_line < lines.len().saturating_sub(1) {
+                                let cursor_pos = self.spatial_cursor.rope_pos.min(rope.len_chars());
+                                let current_line = rope.char_to_line(cursor_pos);
+                                let max_line = rope.len_lines().saturating_sub(1);
+                                
+                                if current_line < max_line {
+                                    let current_char_in_line = cursor_pos - rope.line_to_char(current_line);
                                     let target_line = current_line + 1;
-                                    let target_char = char_in_line.min(lines[target_line].len());
-                                    self.spatial_cursor.rope_pos = self.line_char_to_rope_pos(&lines, target_line, target_char);
+                                    let target_line_start = rope.line_to_char(target_line);
+                                    let target_line_content = rope.line(target_line);
+                                    let target_line_len = target_line_content.len_chars().saturating_sub(1);
+                                    
+                                    // Allow navigation to empty lines
+                                    let target_char = current_char_in_line.min(target_line_len.max(0));
+                                    self.spatial_cursor.rope_pos = target_line_start + target_char;
                                 }
                             }
                             egui::Key::Enter => {
@@ -936,19 +925,8 @@ impl ChonkerApp {
         let live_text = self.spatial_buffer.rope.to_string();
         let start_pos = viewport_start; // Use actual viewport position
         
-        // Proper text formatting with natural line breaks
-        let formatted_text = if live_text.contains('\n') {
-            live_text // Use actual line breaks from rope
-        } else {
-            // Add line breaks every 80 chars only if no natural breaks exist
-            live_text
-                .chars()
-                .collect::<Vec<char>>()
-                .chunks(80)
-                .map(|chunk| chunk.iter().collect::<String>())
-                .collect::<Vec<String>>()
-                .join("\n")
-        };
+        // Use rope's ACTUAL line structure (no artificial chunking)
+        let formatted_text = live_text; // Rope now has proper ALTO-based line breaks
         
         // Update cosmic-text buffer with current content and Kitty-quality rendering
         let kitty_attrs = Attrs::new()
@@ -962,18 +940,8 @@ impl ChonkerApp {
         // Shape the text for proper kerning and glyph positioning
         self.text_buffer.shape_until_scroll(&mut self.font_system, false);
         
-        // Render using cosmic-text's superior layout (simplified approach)
-        // For now, use cosmic-text for measurement but egui for rendering
-        // TODO: Full cosmic-text rendering requires more complex glyph handling
-        
-        // Render text with SF Mono font (Kitty-style)  
-        painter.text(
-            start_pos,
-            egui::Align2::LEFT_TOP,
-            &formatted_text,
-            egui::FontId::monospace(14.0), // SF Mono-like metrics
-            egui::Color32::WHITE
-        );
+        // PURE cosmic-text + ropey rendering (no egui text)
+        self.render_pure_spatial_text(&painter, start_pos, &formatted_text);
     }
     
     fn render_live_paragraph_text(&self, painter: &egui::Painter, scale_x: f32, scale_y: f32) {
@@ -1052,25 +1020,30 @@ impl ChonkerApp {
         }
     }
     
-    fn get_cursor_line_char(&self, lines: &[&str]) -> (usize, usize) {
-        // Calculate which line and character position cursor is on (like Claude Code)
-        let mut char_count = 0;
-        for (line_idx, line) in lines.iter().enumerate() {
-            if self.spatial_cursor.rope_pos <= char_count + line.len() {
-                return (line_idx, self.spatial_cursor.rope_pos - char_count);
-            }
-            char_count += line.len() + 1; // +1 for newline
-        }
-        (lines.len().saturating_sub(1), 0) // Default to last line, start
+    fn get_cursor_line_char(&self, _lines: &[&str]) -> (usize, usize) {
+        // PROPER ropey-based cursor positioning (not string manipulation)
+        let rope = &self.spatial_buffer.rope;
+        let cursor_pos = self.spatial_cursor.rope_pos.min(rope.len_chars());
+        
+        let line_idx = rope.char_to_line(cursor_pos);
+        let line_start = rope.line_to_char(line_idx);
+        let char_in_line = cursor_pos - line_start;
+        
+        (line_idx, char_in_line)
     }
     
-    fn line_char_to_rope_pos(&self, lines: &[&str], target_line: usize, target_char: usize) -> usize {
-        // Convert line/character position back to rope position
-        let mut rope_pos = 0;
-        for i in 0..target_line.min(lines.len()) {
-            rope_pos += lines[i].len() + 1; // +1 for newline
-        }
-        rope_pos + target_char
+    fn line_char_to_rope_pos(&self, _lines: &[&str], target_line: usize, target_char: usize) -> usize {
+        // PROPER ropey-based line/char to position conversion
+        let rope = &self.spatial_buffer.rope;
+        let max_line = rope.len_lines().saturating_sub(1);
+        let clamped_line = target_line.min(max_line);
+        
+        let line_start = rope.line_to_char(clamped_line);
+        let line = rope.line(clamped_line);
+        let line_len = line.len_chars().saturating_sub(1); // Exclude newline
+        let clamped_char = target_char.min(line_len);
+        
+        line_start + clamped_char
     }
     
     fn generate_live_alto_xml(&self) -> String {

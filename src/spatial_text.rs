@@ -184,17 +184,32 @@ impl SpatialTextBuffer {
         let mut rope_text = String::new();
         let mut char_pos = 0;
         
-        // Build unified text and create element mappings
+        // Build rope respecting ALTO structure (TextBlocks and TextLines)
+        let mut current_line_vpos = -1.0;
+        
         for (i, (content, hpos, vpos, width, height)) in elements.iter().enumerate() {
             let start_pos = char_pos;
+            
+            // Add line break when VPOS changes significantly (new TextLine in ALTO)
+            if i > 0 && (vpos - current_line_vpos).abs() > 5.0 {
+                rope_text.push('\n');
+                char_pos += 1;
+                current_line_vpos = *vpos;
+            } else if i == 0 {
+                current_line_vpos = *vpos;
+            }
             
             rope_text.push_str(content);
             char_pos += content.chars().count();
             
-            // Add space between elements (except last)
+            // Add space between elements on same line
             if i < elements.len() - 1 {
-                rope_text.push(' ');
-                char_pos += 1;
+                let next_vpos = elements[i + 1].2;
+                if (next_vpos - vpos).abs() <= 5.0 {
+                    // Same line - add space
+                    rope_text.push(' ');
+                    char_pos += 1;
+                }
             }
             
             let end_pos = char_pos;
